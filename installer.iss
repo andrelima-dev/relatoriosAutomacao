@@ -22,9 +22,9 @@ Name: "desktopicon"; Description: "Criar atalho na Area de Trabalho"; GroupDescr
 Source: "dist\Gerador_OAB.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Gerador de Relatorios OAB"; Filename: "{app}\Gerador_OAB.exe"
-Name: "{group}\Desinstalar"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\Gerador de Relatorios OAB"; Filename: "{app}\Gerador_OAB.exe"; Tasks: desktopicon
+Name: "{userprograms}\Gerador de Relatorios OAB"; Filename: "{app}\Gerador_OAB.exe"
+Name: "{userprograms}\Desinstalar"; Filename: "{uninstallexe}"
+Name: "{userdesktop}\Gerador de Relatorios OAB"; Filename: "{app}\Gerador_OAB.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\Gerador_OAB.exe"; Description: "Iniciar Gerador de Relatorios OAB"; Flags: nowait postinstall skipifsilent
