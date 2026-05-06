@@ -48,20 +48,37 @@ python main.py
 
 ## Como gerar o executável (.exe)
 
-Com o Python instalado, basta executar o script de build:
+**Pré-requisito:** Python 3.10+ instalado com a opção "Add Python to PATH" marcada.
+Download: https://www.python.org/downloads/
 
-**Opção 1 — Dois cliques:**
+Dê dois cliques em `build.bat` — ele instala as dependências automaticamente e gera o `.exe`:
+
 ```
 build.bat
 ```
 
-**Opção 2 — Terminal:**
-```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --name "Gerador_OAB" --add-data "assets;assets" --add-data "core;core" --hidden-import lxml.etree --hidden-import openpyxl --hidden-import pandas main.py
+O executável gerado ficará em `dist\Gerador_OAB.exe`.
+
+---
+
+## Como gerar o instalador Windows (.exe de instalação)
+
+O instalador cria atalho na área de trabalho, menu iniciar e desinstalador.
+
+**Passo 1 — Gere o executável:**
+```
+build.bat
 ```
 
-O executável gerado ficará em `dist\Gerador_OAB.exe`.
+**Passo 2 — Instale o Inno Setup** (gratuito):
+https://jrsoftware.org/isdl.php
+
+**Passo 3 — Gere o instalador:**
+```
+create_installer.bat
+```
+
+O instalador ficará em `installer_output\Gerador_OAB_Setup.exe` — basta enviar esse arquivo para qualquer pessoa instalar normalmente no Windows.
 
 ---
 
