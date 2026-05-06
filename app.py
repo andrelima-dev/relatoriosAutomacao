@@ -9,6 +9,12 @@ from core.leitor import ler_xml
 from core.gerador import gerar_relatorios
 
 
+def _resource_path(relative: str) -> str:
+    """Resolve caminho para recursos, compatível com PyInstaller."""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -20,8 +26,32 @@ class App(tk.Tk):
         self._count_var = tk.StringVar(value="Nenhum arquivo selecionado.")
         self._chk_geral = tk.BooleanVar(value=True)
         self._chk_ativos = tk.BooleanVar(value=True)
+        self._logo_img = None
+        self._icon_img = None
+        self._load_icon()
         self._build_ui()
         self._center()
+
+    # ── Logo ─────────────────────────────────────────────────────────────────
+
+    def _load_icon(self):
+        pass
+
+    def _build_logo_header(self):
+        try:
+            from PIL import Image, ImageTk
+            path = _resource_path(os.path.join("assets", "logo.png"))
+            img = Image.open(path)
+            # Recorta a área do logo (remove fundo cinza ao redor)
+            w, h = img.size
+            crop = img.crop((int(w * 0.08), int(h * 0.28), int(w * 0.92), int(h * 0.72)))
+            crop.thumbnail((260, 70), Image.LANCZOS)
+            self._logo_img = ImageTk.PhotoImage(crop)
+            frm = tk.Frame(self, bg="#FFFFFF")
+            frm.pack(fill="x", padx=0, pady=0)
+            tk.Label(frm, image=self._logo_img, bg="#FFFFFF").pack(pady=(10, 6))
+        except Exception:
+            pass
 
     # ── Layout ───────────────────────────────────────────────────────────────
 

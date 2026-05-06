@@ -4,3 +4,5 @@ __pycache__/
 *.xlsx
 *.xml
 .env
+build/
+dist/
