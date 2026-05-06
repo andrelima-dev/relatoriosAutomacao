@@ -1,7 +1,10 @@
 @echo off
-echo Gerando executavel...
+echo Instalando dependencias...
+pip install -r requirements.txt
 
-"%APPDATA%\Python\Python313\Scripts\pyinstaller.exe" ^
+echo.
+echo Gerando executavel...
+python -m PyInstaller ^
     --onefile --windowed ^
     --name "Gerador_OAB" ^
     --add-data "assets;assets" ^
