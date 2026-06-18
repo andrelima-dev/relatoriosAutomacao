@@ -983,6 +983,25 @@ class App(ttk.Window):
         }
         MAX_RENDER = 500
 
+        # Formata datas de colunas de data para exibição (DD/MM/AAAA)
+        _is_date = is_date_col(col_nome)
+        _DATE_DISPLAY_FMTS = [
+            ("%Y-%m-%d %H:%M:%S", "%d/%m/%Y"),
+            ("%Y-%m-%dT%H:%M:%S.%f", "%d/%m/%Y"),
+            ("%Y-%m-%dT%H:%M:%S", "%d/%m/%Y"),
+            ("%Y-%m-%d", "%d/%m/%Y"),
+        ]
+
+        def _fmt_val(v: str) -> str:
+            if not _is_date:
+                return v
+            for fmt_in, fmt_out in _DATE_DISPLAY_FMTS:
+                try:
+                    return datetime.strptime(v, fmt_in).strftime(fmt_out)
+                except ValueError:
+                    continue
+            return v
+
         dlg = tk.Toplevel(self)
         dlg.title(f"Filtrar — {col_nome}")
         dlg.resizable(False, True)
@@ -996,7 +1015,7 @@ class App(ttk.Window):
             filtro = busca_var.get().strip().lower()
             if not filtro:
                 return valores
-            return [v for v in valores if filtro in v.lower()]
+            return [v for v in valores if filtro in v.lower() or filtro in _fmt_val(v).lower()]
 
         # (Selecionar Tudo) — marca/desmarca TODOS os valores (estilo Excel)
         frm_topo = ttk.Frame(dlg)
@@ -1066,7 +1085,7 @@ class App(ttk.Window):
                     estado[vv] = b.get()
 
                 ttk.Checkbutton(
-                    inner, text=v, variable=bv, command=_on_toggle,
+                    inner, text=_fmt_val(v), variable=bv, command=_on_toggle,
                 ).pack(anchor="w", padx=8, pady=1)
 
             sel_total = sum(1 for v in valores if estado[v])
@@ -1236,7 +1255,7 @@ class App(ttk.Window):
                 self.after(0, lambda: self._log_append(f"Erro: {exc}", "erro"))
             finally:
                 self.after(0, lambda: self._btn_gerar.config(
-                    state="normal", text="Gerar Relatórios"
+                    state="normal", text="▶   Gerar Relatórios"
                 ))
 
         threading.Thread(target=_processar, daemon=True).start()
