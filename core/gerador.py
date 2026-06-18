@@ -29,7 +29,9 @@ _font_data = Font(name="Verdana", size=8)
 _DATE_FORMATS = (
     "%Y-%m-%dT%H:%M:%S.%fZ",
     "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%M:%S.%f",
     "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
     "%d/%m/%Y",
     "%Y-%m-%d",
     "%d-%m-%Y",
