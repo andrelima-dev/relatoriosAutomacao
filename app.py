@@ -11,6 +11,7 @@ from ttkbootstrap.constants import *
 
 from core.gerador import CATEGORIAS_ATIVAS, SITUACOES_ATIVAS, gerar_relatorios
 from core.leitor import carregar_planilha
+from core.powerbi import atualizar_pbix
 from core.utils import get_col, is_date_col
 
 _DATE_PARSE_FMTS = ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d")
@@ -82,6 +83,12 @@ class App(ttk.Window):
         # col_nome -> lista de valores permitidos (ausente = sem filtro / todos)
         self._filtros_coluna_personalizado: dict[str, list[str]] = {}
         self._chk_uf_personalizado = tk.BooleanVar(value=False)
+
+        # Power BI
+        self._chk_powerbi = tk.BooleanVar(value=False)
+        self._pbix_template = tk.StringVar()
+        self._pbix_out_path = tk.StringVar()
+        self._pbix_nome_saida = tk.StringVar()
 
         self._logo_img = None
         self._dlg_loading: tk.Toplevel | None = None
@@ -239,7 +246,47 @@ class App(ttk.Window):
             bootstyle="secondary", font=("Segoe UI", 7),
         ).grid(row=2, column=1, columnspan=5, sticky="w", padx=4, pady=(0, 3))
 
-        # ── 7. Barra de progresso ─────────────────────────────────────────
+        # ── 7. Power BI ───────────────────────────────────────────────────
+        frm_pbi = ttk.LabelFrame(self, text="Power BI  (opcional)")
+        frm_pbi.pack(fill="x", **pad)
+
+        self._chk_pbi_btn = ttk.Checkbutton(
+            frm_pbi, text="Atualizar arquivo Power BI ao gerar",
+            variable=self._chk_powerbi, command=self._toggle_powerbi,
+        )
+        self._chk_pbi_btn.grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(6, 2))
+
+        ttk.Label(frm_pbi, text="Template .pbix:").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        self._ent_pbix_template = ttk.Entry(
+            frm_pbi, textvariable=self._pbix_template, width=38, state="disabled",
+        )
+        self._ent_pbix_template.grid(row=1, column=1, padx=4, pady=3, sticky="ew")
+        self._btn_pbix_sel = ttk.Button(
+            frm_pbi, text="Selecionar...", command=self._selecionar_pbix, state="disabled", width=12,
+        )
+        self._btn_pbix_sel.grid(row=1, column=2, padx=6, pady=3)
+
+        ttk.Label(frm_pbi, text="Salvar .pbix em:").grid(row=2, column=0, sticky="w", padx=6, pady=3)
+        self._ent_pbix_out = ttk.Entry(
+            frm_pbi, textvariable=self._pbix_out_path, width=38, state="disabled",
+        )
+        self._ent_pbix_out.grid(row=2, column=1, padx=4, pady=3, sticky="ew")
+        self._btn_pbix_out = ttk.Button(
+            frm_pbi, text="Alterar", command=self._selecionar_pbix_pasta, state="disabled", width=12,
+        )
+        self._btn_pbix_out.grid(row=2, column=2, padx=6, pady=3)
+
+        ttk.Label(frm_pbi, text="Nome do arquivo:").grid(row=3, column=0, sticky="w", padx=6, pady=3)
+        self._ent_pbix_nome = ttk.Entry(
+            frm_pbi, textvariable=self._pbix_nome_saida, width=38, state="disabled",
+        )
+        self._ent_pbix_nome.grid(row=3, column=1, padx=4, pady=(3, 6), sticky="ew")
+        ttk.Label(
+            frm_pbi, text="(vazio = data + nome do template)",
+            bootstyle="secondary", font=("Segoe UI", 7),
+        ).grid(row=3, column=2, sticky="w", padx=6)
+
+        # ── 8. Barra de progresso ─────────────────────────────────────────
         frm_prog = ttk.Frame(self)
         frm_prog.pack(fill="x", padx=12, pady=(2, 0))
         self._progress = ttk.Progressbar(
@@ -278,7 +325,7 @@ class App(ttk.Window):
         self._log.tag_config("info",   foreground=_LOG["info"])
         self._log.tag_config("normal", foreground=_LOG["fg"])
 
-        self.geometry("680x820")
+        self.geometry("680x960")
 
     def _center(self):
         self.update_idletasks()
@@ -1172,6 +1219,32 @@ class App(ttk.Window):
         y = self.winfo_y() + (self.winfo_height() - dlg.winfo_reqheight()) // 2
         dlg.geometry(f"+{x}+{y}")
 
+    # ── Power BI ──────────────────────────────────────────────────────────────
+
+    def _toggle_powerbi(self):
+        state = "normal" if self._chk_powerbi.get() else "disabled"
+        for w in (
+            self._ent_pbix_template, self._btn_pbix_sel,
+            self._ent_pbix_out, self._btn_pbix_out,
+            self._ent_pbix_nome,
+        ):
+            w.config(state=state)
+
+    def _selecionar_pbix(self):
+        path = filedialog.askopenfilename(
+            title="Selecionar template Power BI",
+            filetypes=[("Power BI", "*.pbix"), ("Todos", "*.*")],
+        )
+        if path:
+            self._pbix_template.set(path)
+            if not self._pbix_out_path.get():
+                self._pbix_out_path.set(os.path.dirname(path))
+
+    def _selecionar_pbix_pasta(self):
+        pasta = filedialog.askdirectory(title="Pasta para salvar o .pbix")
+        if pasta:
+            self._pbix_out_path.set(pasta)
+
     # ── Gerar ─────────────────────────────────────────────────────────────────
 
     def _gerar(self):
@@ -1223,6 +1296,12 @@ class App(ttk.Window):
             if personalizado_ok else None
         )
 
+        # Power BI
+        pbi_ativo = self._chk_powerbi.get()
+        pbi_template = self._pbix_template.get().strip()
+        pbi_out = self._pbix_out_path.get().strip() or pasta
+        pbi_nome = self._pbix_nome_saida.get().strip() or None
+
         def _processar():
             def progress(pct: int):
                 self.after(0, lambda p=pct: self._progress.config(value=p))
@@ -1250,7 +1329,18 @@ class App(ttk.Window):
                 self.after(0, lambda: self._log_append(
                     f"Concluído! Arquivos salvos em: {pasta}", "ok"
                 ))
-                self.after(0, lambda: self._abrir_pasta(pasta))
+
+                if pbi_ativo and pbi_template:
+                    try:
+                        log("Atualizando Power BI...", "info")
+                        dest = atualizar_pbix(pbi_template, pbi_out, pbi_nome or None)
+                        nome_gerado = os.path.basename(dest)
+                        log(f"Power BI atualizado: {nome_gerado}", "ok")
+                        self.after(0, lambda d=pbi_out: self._abrir_pasta(d))
+                    except Exception as exc:
+                        log(f"Erro ao atualizar Power BI: {exc}", "erro")
+                else:
+                    self.after(0, lambda: self._abrir_pasta(pasta))
             except Exception as exc:
                 self.after(0, lambda: self._log_append(f"Erro: {exc}", "erro"))
             finally:
