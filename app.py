@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import threading
@@ -30,6 +31,26 @@ _LOG = {
 def _resource_path(relative: str) -> str:
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative)
+
+
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+_PBIX_BUNDLED = _resource_path(os.path.join("assets", "template_powerbi.pbix"))
+
+
+def _load_config() -> dict:
+    try:
+        with open(_CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_config(data: dict):
+    try:
+        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 class App(ttk.Window):
@@ -84,11 +105,15 @@ class App(ttk.Window):
         self._filtros_coluna_personalizado: dict[str, list[str]] = {}
         self._chk_uf_personalizado = tk.BooleanVar(value=False)
 
-        # Power BI
-        self._chk_powerbi = tk.BooleanVar(value=False)
-        self._pbix_template = tk.StringVar()
-        self._pbix_out_path = tk.StringVar()
-        self._pbix_nome_saida = tk.StringVar()
+        # Power BI — carrega config salva; usa template bundled como padrão
+        _cfg = _load_config()
+        _tmpl_default = _cfg.get("pbix_template", "")
+        if not _tmpl_default or not os.path.isfile(_tmpl_default):
+            _tmpl_default = _PBIX_BUNDLED if os.path.isfile(_PBIX_BUNDLED) else ""
+        self._chk_powerbi = tk.BooleanVar(value=bool(_tmpl_default))
+        self._pbix_template = tk.StringVar(value=_tmpl_default)
+        self._pbix_out_path = tk.StringVar(value=_cfg.get("pbix_out_path", ""))
+        self._pbix_nome_saida = tk.StringVar(value=_cfg.get("pbix_nome_saida", ""))
 
         self._logo_img = None
         self._dlg_loading: tk.Toplevel | None = None
@@ -326,6 +351,9 @@ class App(ttk.Window):
         self._log.tag_config("normal", foreground=_LOG["fg"])
 
         self.geometry("680x960")
+
+        # Aplica estado inicial do Power BI baseado no config carregado
+        self.after(100, self._toggle_powerbi)
 
     def _center(self):
         self.update_idletasks()
@@ -1229,6 +1257,14 @@ class App(ttk.Window):
             self._ent_pbix_nome,
         ):
             w.config(state=state)
+        self._salvar_config_pbi()
+
+    def _salvar_config_pbi(self):
+        cfg = _load_config()
+        cfg["pbix_template"] = self._pbix_template.get()
+        cfg["pbix_out_path"] = self._pbix_out_path.get()
+        cfg["pbix_nome_saida"] = self._pbix_nome_saida.get()
+        _save_config(cfg)
 
     def _selecionar_pbix(self):
         path = filedialog.askopenfilename(
@@ -1239,11 +1275,13 @@ class App(ttk.Window):
             self._pbix_template.set(path)
             if not self._pbix_out_path.get():
                 self._pbix_out_path.set(os.path.dirname(path))
+            self._salvar_config_pbi()
 
     def _selecionar_pbix_pasta(self):
         pasta = filedialog.askdirectory(title="Pasta para salvar o .pbix")
         if pasta:
             self._pbix_out_path.set(pasta)
+            self._salvar_config_pbi()
 
     # ── Gerar ─────────────────────────────────────────────────────────────────
 
