@@ -33,7 +33,14 @@ def _resource_path(relative: str) -> str:
     return os.path.join(base, relative)
 
 
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+def _app_dir() -> str:
+    # Diretório gravável: ao lado do .exe (frozen) ou do script (dev)
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_CONFIG_PATH = os.path.join(_app_dir(), "config.json")
 _PBIX_BUNDLED = _resource_path(os.path.join("assets", "template_powerbi.pbix"))
 
 
@@ -707,10 +714,12 @@ class App(ttk.Window):
         personalizado_ok = (
             self._chk_personalizado.get() and bool(self._colunas_personalizado)
         )
+        pbi_ok = self._chk_powerbi.get() and bool(self._pbix_template.get().strip())
         nenhum = (
             not self._chk_geral.get()
             and not self._chk_ativos.get()
             and not personalizado_ok
+            and not pbi_ok
         )
         self._btn_gerar.config(state="disabled" if nenhum else "normal")
 
@@ -1258,10 +1267,17 @@ class App(ttk.Window):
         ):
             w.config(state=state)
         self._salvar_config_pbi()
+        self._validar_selecao()
 
     def _salvar_config_pbi(self):
         cfg = _load_config()
-        cfg["pbix_template"] = self._pbix_template.get()
+        tmpl = self._pbix_template.get()
+        # Não persiste o caminho do template embutido — ele varia por máquina.
+        # Vazio faz o app sempre resolver para o template em assets/.
+        if tmpl and os.path.abspath(tmpl) == os.path.abspath(_PBIX_BUNDLED):
+            cfg["pbix_template"] = ""
+        else:
+            cfg["pbix_template"] = tmpl
         cfg["pbix_out_path"] = self._pbix_out_path.get()
         cfg["pbix_nome_saida"] = self._pbix_nome_saida.get()
         _save_config(cfg)
@@ -1286,22 +1302,43 @@ class App(ttk.Window):
     # ── Gerar ─────────────────────────────────────────────────────────────────
 
     def _gerar(self):
-        if self._df is None:
-            self._log_append("Selecione um arquivo válido antes de gerar.", "erro")
-            return
-        pasta = self._out_path.get().strip()
-        if not pasta:
-            self._log_append("Informe a pasta de saída.", "erro")
-            return
-
         personalizado_ok = self._chk_personalizado.get() and bool(self._colunas_personalizado)
         if self._chk_personalizado.get() and not self._colunas_personalizado:
             self._log_append(
                 "Relatório personalizado: clique 'Selecionar Colunas...' e escolha "
                 "ao menos uma coluna.", "erro")
             return
-        if not self._chk_geral.get() and not self._chk_ativos.get() and not personalizado_ok:
-            self._log_append("Selecione ao menos um relatório para gerar.", "erro")
+
+        gera_excel = self._chk_geral.get() or self._chk_ativos.get() or personalizado_ok
+        pbi_template = self._pbix_template.get().strip()
+        pbi_ok = self._chk_powerbi.get() and bool(pbi_template)
+
+        if not gera_excel and not pbi_ok:
+            self._log_append(
+                "Selecione ao menos um relatório ou ative o Power BI para gerar.", "erro")
+            return
+
+        # Arquivo de dados só é necessário para gerar Excel; o Power BI sozinho
+        # apenas atualiza a data no template, sem precisar da planilha.
+        if gera_excel and self._df is None:
+            self._log_append("Selecione um arquivo válido antes de gerar.", "erro")
+            return
+
+        if pbi_ok and not os.path.isfile(pbi_template):
+            self._log_append(
+                f"Template Power BI não encontrado: {pbi_template}", "erro")
+            return
+
+        pasta = self._out_path.get().strip()
+        if gera_excel and not pasta:
+            self._log_append("Informe a pasta de saída.", "erro")
+            return
+
+        # Pasta de destino do .pbix: usa a configurada ou cai na pasta do Excel
+        pbi_out = self._pbix_out_path.get().strip() or pasta
+        if pbi_ok and not pbi_out:
+            self._log_append(
+                "Informe onde salvar o Power BI (campo 'Salvar .pbix em').", "erro")
             return
 
         filtro_data_ativo = self._chk_filtro_data.get() and bool(self._date_cols)
@@ -1325,7 +1362,7 @@ class App(ttk.Window):
         self._progress["value"] = 0
         self._log_clear()
 
-        df = self._df.copy()
+        df = self._df.copy() if self._df is not None else None
         colunas_pers = list(self._colunas_personalizado) if personalizado_ok else None
         base_pers = self._base_personalizado.get()
         filtros_valores_pers = (
@@ -1334,10 +1371,6 @@ class App(ttk.Window):
             if personalizado_ok else None
         )
 
-        # Power BI
-        pbi_ativo = self._chk_powerbi.get()
-        pbi_template = self._pbix_template.get().strip()
-        pbi_out = self._pbix_out_path.get().strip() or pasta
         pbi_nome = self._pbix_nome_saida.get().strip() or None
 
         def _processar():
@@ -1347,40 +1380,37 @@ class App(ttk.Window):
             def log(msg, tag="normal"):
                 self.after(0, lambda m=msg, t=tag: self._log_append(m, t))
 
+            abrir = pasta
             try:
-                gerar_relatorios(
-                    df, pasta, log,
-                    gerar_geral=geral,
-                    gerar_ativos=ativos,
-                    categorias_filtro=cats,
-                    situacoes_filtro=sits,
-                    data_col=data_col,
-                    data_inicio=data_inicio,
-                    data_fim=data_fim,
-                    nome_base=nome_base,
-                    progress_cb=progress,
-                    gerar_personalizado=personalizado_ok,
-                    colunas_personalizado=colunas_pers,
-                    filtros_valores_personalizado=filtros_valores_pers,
-                    personalizado_base=base_pers,
-                )
-                self.after(0, lambda: self._log_append(
-                    f"Concluído! Arquivos salvos em: {pasta}", "ok"
-                ))
+                if gera_excel:
+                    gerar_relatorios(
+                        df, pasta, log,
+                        gerar_geral=geral,
+                        gerar_ativos=ativos,
+                        categorias_filtro=cats,
+                        situacoes_filtro=sits,
+                        data_col=data_col,
+                        data_inicio=data_inicio,
+                        data_fim=data_fim,
+                        nome_base=nome_base,
+                        progress_cb=progress,
+                        gerar_personalizado=personalizado_ok,
+                        colunas_personalizado=colunas_pers,
+                        filtros_valores_personalizado=filtros_valores_pers,
+                        personalizado_base=base_pers,
+                    )
+                    log(f"Concluído! Arquivos salvos em: {pasta}", "ok")
 
-                if pbi_ativo and pbi_template:
-                    try:
-                        log("Atualizando Power BI...", "info")
-                        dest = atualizar_pbix(pbi_template, pbi_out, pbi_nome or None)
-                        nome_gerado = os.path.basename(dest)
-                        log(f"Power BI atualizado: {nome_gerado}", "ok")
-                        self.after(0, lambda d=pbi_out: self._abrir_pasta(d))
-                    except Exception as exc:
-                        log(f"Erro ao atualizar Power BI: {exc}", "erro")
-                else:
-                    self.after(0, lambda: self._abrir_pasta(pasta))
+                if pbi_ok:
+                    log("Atualizando Power BI...", "info")
+                    dest = atualizar_pbix(pbi_template, pbi_out, pbi_nome)
+                    log(f"Power BI atualizado: {os.path.basename(dest)}", "ok")
+                    abrir = pbi_out
+
+                progress(100)
+                self.after(0, lambda d=abrir: self._abrir_pasta(d))
             except Exception as exc:
-                self.after(0, lambda: self._log_append(f"Erro: {exc}", "erro"))
+                self.after(0, lambda e=exc: self._log_append(f"Erro: {e}", "erro"))
             finally:
                 self.after(0, lambda: self._btn_gerar.config(
                     state="normal", text="▶   Gerar Relatórios"

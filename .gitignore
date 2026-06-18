@@ -12,3 +12,4 @@ dist/
 .rtk/
 CLAUDE.md
 installer_output/
+config.json
