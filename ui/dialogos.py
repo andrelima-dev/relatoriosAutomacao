@@ -594,11 +594,15 @@ class DialogoAdimplencia(QDialog):
 
 
 class DialogoMapeamentoCsv(QDialog):
-    """Mostra qual coluna do arquivo alimenta cada campo do CSV da OAB-MA."""
+    """Mostra qual coluna do arquivo alimenta cada campo do CSV.
 
-    def __init__(self, pai, mapeamento: list[tuple[str, str | None]]):
+    Serve aos dois layouts (OAB PREV e Jusbrasil); o nome vem no título.
+    """
+
+    def __init__(self, pai, mapeamento: list[tuple[str, str | None]],
+                 layout: str = "OAB PREV"):
         super().__init__(pai)
-        self.setWindowTitle("Mapeamento — CSV de importação OAB-MA")
+        self.setWindowTitle(f"Mapeamento — CSV de importação {layout}")
         self.resize(500, 600)
 
         col = QVBoxLayout(self)

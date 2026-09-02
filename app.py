@@ -45,6 +45,7 @@ from core.csv_oabma import (
     mapear_para_oabma,
     periodo_jovem_padrao,
 )
+from core.csv_jusbrasil import exportar_csv_jusbrasil, mapear_para_jusbrasil
 from core.gerador import (
     CATEGORIAS_ATIVAS,
     SITUACOES_ATIVAS,
@@ -281,7 +282,8 @@ class App(QMainWindow):
         self._abas.addTab(self._aba_prontos(), "Relatórios prontos")
         self._abas.addTab(self._aba_personalizado(), "Personalizado")
         self._abas.addTab(self._aba_subsecao(), "Por subseção")
-        self._abas.addTab(self._aba_csv(), "CSV OAB-MA")
+        self._abas.addTab(self._aba_csv(), "OAB PREV")
+        self._abas.addTab(self._aba_jusbrasil(), "Jusbrasil")
         # O painel acompanha a altura da aba atual. Sem isto o QTabWidget
         # reserva a altura da maior aba e sobra um vazio nas demais.
         self._abas.currentChanged.connect(self._ajustar_altura_aba)
@@ -501,13 +503,51 @@ class App(QMainWindow):
         col.addWidget(self._lbl_csv_jovem)
 
         col.addWidget(_dica(
-            "CSV com as 20 colunas do layout de importação. O mapeamento das "
-            "colunas é automático — confira antes de importar."))
+            "CSV com as 20 colunas do layout de importação da OAB PREV. O "
+            "mapeamento das colunas é automático — confira antes de importar."))
 
-        self._btn_csv = QPushButton("▶  Gerar CSV de importação", objectName="Acao")
+        self._btn_csv = QPushButton("▶  Gerar CSV OAB PREV", objectName="Acao")
         self._btn_csv.setEnabled(False)
         self._btn_csv.clicked.connect(self._gerar_csv)
         col.addWidget(self._btn_csv, 0, Qt.AlignLeft)
+        col.addStretch(1)
+        return w
+
+    def _aba_jusbrasil(self) -> QWidget:
+        w = QWidget()
+        col = QVBoxLayout(w)
+        col.setContentsMargins(14, 14, 14, 14)
+        col.setSpacing(8)
+
+        lin = QHBoxLayout()
+        self._btn_jus_mapa = QPushButton("Ver mapeamento...")
+        self._btn_jus_mapa.setEnabled(False)
+        self._btn_jus_mapa.clicked.connect(self._abrir_mapeamento_jusbrasil)
+        lin.addWidget(self._btn_jus_mapa)
+        lin.addStretch(1)
+        col.addLayout(lin)
+
+        lin2 = QHBoxLayout()
+        lin2.addWidget(QLabel("Base:"))
+        self._rb_jus_ativos = QRadioButton("Apenas ativos")
+        self._rb_jus_ativos.setChecked(True)
+        self._rb_jus_ativos.setEnabled(False)
+        self._rb_jus_todos = QRadioButton("Todos")
+        self._rb_jus_todos.setEnabled(False)
+        lin2.addWidget(self._rb_jus_ativos)
+        lin2.addWidget(self._rb_jus_todos)
+        lin2.addStretch(1)
+        col.addLayout(lin2)
+
+        col.addWidget(_dica(
+            "CSV com as 6 colunas do modelo do Jusbrasil: nome, e-mail, CPF, "
+            "data de nascimento, nº da OAB e data de inscrição. O CPF sai "
+            "com máscara (000.000.000-00)."))
+
+        self._btn_jus = QPushButton("▶  Gerar CSV Jusbrasil", objectName="Acao")
+        self._btn_jus.setEnabled(False)
+        self._btn_jus.clicked.connect(self._gerar_jusbrasil)
+        col.addWidget(self._btn_jus, 0, Qt.AlignLeft)
         col.addStretch(1)
         return w
 
@@ -758,7 +798,8 @@ class App(QMainWindow):
                   self._btn_sep_subsecoes, self._btn_sep_colunas,
                   self._chk_sep_adim, self._rb_sep_ativos, self._rb_sep_todos,
                   self._btn_csv_mapa, self._rb_csv_ativos, self._rb_csv_todos,
-                  self._btn_csv_jovem):
+                  self._btn_csv_jovem, self._btn_jus_mapa,
+                  self._rb_jus_ativos, self._rb_jus_todos):
             w.setEnabled(True)
 
         self._sep_subsecoes = []
@@ -1049,7 +1090,7 @@ class App(QMainWindow):
             jovem_desde=self._jovem_desde,
             jovem_ate=self._jovem_ate,
         )
-        DialogoMapeamentoCsv(self, mapa).exec()
+        DialogoMapeamentoCsv(self, mapa, "OAB PREV").exec()
 
     # ── Rótulos ──────────────────────────────────────────────────────────────
 
@@ -1154,6 +1195,7 @@ class App(QMainWindow):
             tem and (self._chk_geral.isChecked() or self._chk_ativos.isChecked()))
         self._btn_pers.setEnabled(tem and bool(self._colunas_personalizado))
         self._btn_csv.setEnabled(tem)
+        self._btn_jus.setEnabled(tem)
         self._btn_separados.setEnabled(tem and bool(self._uf_col))
 
         if not tem:
@@ -1202,7 +1244,7 @@ class App(QMainWindow):
 
     def _acoes(self) -> tuple:
         return (self._btn_prontos, self._btn_pers, self._btn_csv,
-                self._btn_separados)
+                self._btn_jus, self._btn_separados)
 
     def _ocupado(self, ocupado: bool, botao=None, rotulo: str = ""):
         for b in self._acoes():
@@ -1346,7 +1388,38 @@ class App(QMainWindow):
 
         self._executar(self._btn_csv, _trabalho)
 
-    # ── Ação 4: relatórios separados por subseção ────────────────────────────
+    # ── Ação 4: CSV do Jusbrasil ─────────────────────────────────────────────
+
+    def _abrir_mapeamento_jusbrasil(self):
+        if self._df is None:
+            return
+        _, mapa = mapear_para_jusbrasil(self._df)
+        DialogoMapeamentoCsv(self, mapa, "Jusbrasil").exec()
+
+    def _gerar_jusbrasil(self):
+        p = self._base_parametros()
+        if p is None:
+            return
+        base = "ativos" if self._rb_jus_ativos.isChecked() else "geral"
+
+        def _trabalho(sinais):
+            exportar_csv_jusbrasil(
+                p["df"], p["pasta"],
+                lambda m, t="normal": sinais.log.emit(m, t),
+                base=base,
+                categorias_filtro=p["cats"],
+                situacoes_filtro=p["sits"],
+                data_col=p["data_col"],
+                data_inicio=p["data_inicio"],
+                data_fim=p["data_fim"],
+                nome_base=p["nome_base"],
+                progress_cb=sinais.progresso.emit,
+            )
+            return p["pasta"]
+
+        self._executar(self._btn_jus, _trabalho)
+
+    # ── Ação 5: relatórios separados por subseção ────────────────────────────
 
     def _gerar_separados_click(self):
         if self._df is None:

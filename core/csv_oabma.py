@@ -1,4 +1,4 @@
-"""Exportação no layout de importação do sistema OAB-MA.
+"""Exportação no layout de importação do sistema OAB PREV.
 
 O arquivo de origem (XML/Excel da OAB) não tem nomes de coluna fixos, então
 cada um dos 20 campos do layout é resolvido por uma lista de candidatos e, se
@@ -21,7 +21,7 @@ from core.gerador import (
     normalizar_filtros,
 )
 
-# Ordem e grafia exatas esperadas pelo importador da OAB-MA
+# Ordem e grafia exatas esperadas pelo importador da OAB PREV
 COLUNAS_OABMA = [
     "nome", "registro", "categoria", "subsecao", "tipoInscricao",
     "cpf", "sexo", "adimplente", "logradouro", "bairro",
@@ -163,8 +163,13 @@ def periodo_jovem_padrao(anos: int = ANOS_JOVEM_PADRAO) -> tuple[date, date]:
     return date(ano - anos, 1, 1), date(ano, 12, 31)
 
 
-def _achar_col(df: pd.DataFrame, campo: str) -> str | None:
-    exatos, contem, evitar = _ORIGENS[campo]
+def achar_coluna(df: pd.DataFrame, exatos: tuple[str, ...],
+                 contem: tuple[str, ...] = (),
+                 evitar: tuple[str, ...] = ()) -> str | None:
+    """Resolve uma coluna: primeiro por nome exato, depois por aproximação,
+    pulando as que contenham termos desqualificantes.
+
+    Também usada pela exportação Jusbrasil (core/csv_jusbrasil.py)."""
     cols_upper = {str(c).strip().upper(): c for c in df.columns}
 
     for nome in exatos:
@@ -177,6 +182,10 @@ def _achar_col(df: pd.DataFrame, campo: str) -> str | None:
         if any(t in upper for t in contem):
             return original
     return None
+
+
+def _achar_col(df: pd.DataFrame, campo: str) -> str | None:
+    return achar_coluna(df, *_ORIGENS[campo])
 
 
 def _texto(v) -> str:
@@ -269,7 +278,7 @@ def mapear_para_oabma(
     jovem_desde: date | None = None,
     jovem_ate: date | None = None,
 ) -> tuple[pd.DataFrame, list[tuple[str, str | None]]]:
-    """Converte o df de origem no layout OAB-MA.
+    """Converte o df de origem no layout OAB PREV.
 
     Devolve (df_no_layout, mapeamento), onde mapeamento lista cada campo e a
     origem usada (None quando o campo não pôde ser preenchido).
@@ -328,7 +337,7 @@ def mapear_para_oabma(
 
 def _nome_csv(nome_base: str) -> str:
     hoje = date.today().strftime("%d-%m-%Y")
-    return f"{nome_base} IMPORTACAO OABMA {hoje}.csv"
+    return f"{nome_base} IMPORTACAO OAB PREV {hoje}.csv"
 
 
 def _salvar_csv(df: pd.DataFrame, path: str,
@@ -382,12 +391,12 @@ def exportar_csv_oabma(
     jovem_ate: date | None = None,
     progress_cb: Callable[[int], None] | None = None,
 ) -> str:
-    """Gera o CSV no layout de importação da OAB-MA e devolve o caminho salvo."""
+    """Gera o CSV no layout de importação da OAB PREV e devolve o caminho salvo."""
     os.makedirs(pasta_saida, exist_ok=True)
     if progress_cb:
         progress_cb(5)
 
-    log_cb("Gerando CSV de importação (OAB-MA)...", "info")
+    log_cb("Gerando CSV de importação (OAB PREV)...", "info")
 
     df_base = aplicar_filtro_data(df, data_col, data_inicio, data_fim)
     if base == "ativos":
@@ -415,7 +424,7 @@ def exportar_csv_oabma(
 
     path = _salvar_csv(df_csv, os.path.join(pasta_saida, _nome_csv(nome_base)), log_cb)
     log_cb(
-        f"Gerando CSV de importação (OAB-MA)... ✔ ({len(df_csv)} registros, "
+        f"Gerando CSV de importação (OAB PREV)... ✔ ({len(df_csv)} registros, "
         f"{len(COLUNAS_OABMA)} colunas)",
         "ok",
     )

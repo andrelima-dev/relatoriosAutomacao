@@ -5,7 +5,7 @@
 ; instalador reconhece (e remove) as versoes ja instaladas.
 #define MyAppId "{8F3A6C21-4D7B-4E92-9C15-2A0B7E5D3F84}"
 #define MyAppName "Gerador de Relatorios OAB"
-#define MyAppVersion "2.3"
+#define MyAppVersion "2.4"
 #define MyAppPublisher "andrelima-dev"
 #define MyAppExe "Gerador_OAB.exe"
 
