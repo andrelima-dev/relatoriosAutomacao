@@ -27,6 +27,17 @@ if not exist "dist\Gerador_OAB.exe" (
     exit /b 1
 )
 
+REM As imagens do assistente sao geradas a partir do logo
+if not exist "assets\wizard.bmp" (
+    echo Gerando imagens do assistente...
+    python gerar_imagens_instalador.py
+    if errorlevel 1 (
+        echo [ERRO] Falha ao gerar as imagens do assistente.
+        pause
+        exit /b 1
+    )
+)
+
 echo Compilando installer...
 %ISCC% installer.iss
 
@@ -40,4 +51,8 @@ echo.
 echo ========================================
 echo  Concluido! Installer em: installer_output\Gerador_OAB_Setup.exe
 echo ========================================
+echo.
+echo Envie esse unico arquivo para o outro usuario.
+echo Ele detecta e remove a versao anterior automaticamente.
+echo.
 pause

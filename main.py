@@ -1,80 +1,69 @@
 import os
 import sys
-import tkinter as tk
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
+from PySide6.QtWidgets import QApplication, QSplashScreen
+
+from core.utils import resource_path
+from ui.tema import folha_de_estilo, paleta
+
+_LARGURA, _ALTURA = 420, 220
 
 
-def _resource_path(relative):
-    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, relative)
+def _criar_splash(cores) -> QSplashScreen:
+    """Tela de abertura desenhada à mão — some assim que a janela abre."""
+    pix = QPixmap(_LARGURA, _ALTURA)
+    pix.fill(QColor(cores["superficie"]))
 
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
 
-def _show_splash():
-    splash = tk.Tk()
-    splash.overrideredirect(True)
-    splash.configure(bg="#FFFFFF")
-    splash.attributes("-topmost", True)
+    p.fillRect(0, _ALTURA - 4, _LARGURA, 4, QColor(cores["acento"]))
+    p.setPen(QColor(cores["borda_forte"]))
+    p.drawRect(0, 0, _LARGURA - 1, _ALTURA - 1)
 
-    # Borda sutil
-    outer = tk.Frame(splash, bg="#CCCCCC", padx=1, pady=1)
-    outer.pack(fill="both", expand=True)
-    inner = tk.Frame(outer, bg="#FFFFFF")
-    inner.pack(fill="both", expand=True)
+    logo = resource_path(os.path.join("assets", "logo.png"))
+    y_texto = 96
+    if os.path.exists(logo):
+        img = QPixmap(logo)
+        if not img.isNull():
+            img = img.scaledToHeight(70, Qt.SmoothTransformation)
+            p.drawPixmap((_LARGURA - img.width()) // 2, 30, img)
+            y_texto = 124
 
-    # Logo
-    try:
-        from PIL import Image, ImageTk
-        img = Image.open(_resource_path(os.path.join("assets", "logo.png")))
-        bbox = img.getbbox()
-        if bbox:
-            img = img.crop(bbox)
-        img.thumbnail((300, 170), Image.LANCZOS)
-        photo = ImageTk.PhotoImage(img)
-        lbl = tk.Label(inner, image=photo, bg="#FFFFFF")
-        lbl.image = photo
-        lbl.pack(padx=50, pady=(30, 8))
-    except Exception:
-        tk.Label(
-            inner, text="Gerador de Relatórios OAB",
-            font=("Verdana", 13, "bold"), fg="#1565C0", bg="#FFFFFF"
-        ).pack(padx=50, pady=(30, 8))
+    p.setPen(QColor(cores["texto"]))
+    p.setFont(QFont("Segoe UI", 15, QFont.Bold))
+    p.drawText(0, y_texto, _LARGURA, 30, Qt.AlignCenter,
+               "Gerador de Relatórios OAB")
 
-    tk.Label(inner, text="Carregando...", font=("Verdana", 8),
-             fg="#999999", bg="#FFFFFF").pack(pady=(0, 16))
+    p.setPen(QColor(cores["texto_dim"]))
+    p.setFont(QFont("Segoe UI", 9))
+    p.drawText(0, y_texto + 30, _LARGURA, 24, Qt.AlignCenter, "Carregando...")
 
-    # Barra de progresso
-    bar_bg = tk.Frame(inner, bg="#E3F2FD", height=5)
-    bar_bg.pack(fill="x", padx=0, pady=0)
-    bar_bg.pack_propagate(False)
-    bar = tk.Frame(bar_bg, bg="#1565C0", height=5, width=0)
-    bar.place(x=0, y=0, relheight=1)
+    p.setPen(QColor(cores["borda_forte"]))
+    p.setFont(QFont("Segoe UI", 8))
+    p.drawText(0, _ALTURA - 30, _LARGURA - 14, 20,
+               Qt.AlignRight | Qt.AlignVCenter, "created by andrelima-dev")
+    p.end()
 
-    # Centraliza na tela
-    splash.update_idletasks()
-    w = splash.winfo_reqwidth()
-    h = splash.winfo_reqheight()
-    sw = splash.winfo_screenwidth()
-    sh = splash.winfo_screenheight()
-    splash.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
-    splash.update()
-
-    # Anima a barra de 0 a 100%
-    def _animate(step=0):
-        if step <= 100:
-            bar.place(x=0, y=0, relheight=1, width=int(w * step / 100))
-            splash.update()
-            splash.after(12, _animate, step + 2)
-
-    _animate()
-    return splash
+    return QSplashScreen(pix, Qt.WindowStaysOnTopHint)
 
 
 if __name__ == "__main__":
-    splash = _show_splash()
-    splash.update()
+    qt_app = QApplication(sys.argv)
+    qt_app.setApplicationName("Gerador de Relatórios OAB")
+    cores = paleta()
+    qt_app.setStyleSheet(folha_de_estilo())
 
-    from app import App  # import pesado acontece aqui
+    splash = _criar_splash(cores)
+    splash.show()
+    qt_app.processEvents()
 
-    splash.destroy()
+    from app import App  # import pesado (pandas, openpyxl) acontece aqui
 
-    app = App()
-    app.mainloop()
+    janela = App()
+    janela.show()
+    splash.finish(janela)
+
+    sys.exit(qt_app.exec())

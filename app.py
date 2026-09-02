@@ -1,610 +1,814 @@
-import json
+"""Janela principal (PySide6).
+
+O pacote `core` é agnóstico de interface — recebe DataFrames e callbacks —,
+então toda a lógica de geração é reaproveitada sem alteração. O trabalho pesado
+roda em QThreadPool e volta para a interface por sinais.
+"""
+
+import html
 import os
 import sys
-import threading
-import tkinter as tk
+import unicodedata
 from datetime import datetime
-from tkinter import filedialog, messagebox
-from tkinter.scrolledtext import ScrolledText
 
-import ttkbootstrap as ttk
-from ttkbootstrap.constants import *
+from PySide6.QtCore import QDate, QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtGui import QGuiApplication, QIcon, QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDateEdit,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSizePolicy,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
-from core.gerador import CATEGORIAS_ATIVAS, SITUACOES_ATIVAS, gerar_relatorios
+from core.csv_oabma import (
+    ANOS_JOVEM_PADRAO,
+    exportar_csv_oabma,
+    mapear_para_oabma,
+    periodo_jovem_padrao,
+)
+from core.gerador import (
+    CATEGORIAS_ATIVAS,
+    SITUACOES_ATIVAS,
+    gerar_relatorios,
+    gerar_relatorios_separados,
+)
 from core.leitor import carregar_planilha
-from core.powerbi import atualizar_pbix
-from core.utils import get_col, is_date_col
+from core.utils import get_col, is_date_col, resource_path
+from ui.dialogos import (
+    DialogoAdimplencia,
+    DialogoCarregando,
+    DialogoColunas,
+    DialogoFiltrosAtivos,
+    DialogoJovemAdvogado,
+    DialogoListaMarcavel,
+    DialogoMapeamentoCsv,
+)
+from ui.tema import paleta
 
-_DATE_PARSE_FMTS = ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d")
-
-# Cores de log e elementos não cobertos pelo tema
-_LOG = {
-    "bg":   "#1e2d3d",
-    "fg":   "#d4dce6",
-    "ok":   "#56d364",
-    "err":  "#f85149",
-    "info": "#58a6ff",
-    "dim":  "#8b949e",
-}
-
-
-def _resource_path(relative: str) -> str:
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, relative)
+_DATA_SENTINELA = QDate(1900, 1, 1)
+_ALTURA_LOG = 68
 
 
-def _app_dir() -> str:
-    # Diretório gravável: ao lado do .exe (frozen) ou do script (dev)
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+class _Sinais(QObject):
+    progresso = Signal(int)
+    log = Signal(str, str)
+    falhou = Signal(str)
+    terminou = Signal(object)
 
 
-_CONFIG_PATH = os.path.join(_app_dir(), "config.json")
-_PBIX_BUNDLED = _resource_path(os.path.join("assets", "template_powerbi.pbix"))
+class Tarefa(QRunnable):
+    """Executa uma função em outra thread e devolve o resultado por sinal."""
+
+    def __init__(self, fn):
+        super().__init__()
+        self.setAutoDelete(False)
+        self._fn = fn
+        self.sinais = _Sinais()
+
+    def run(self):
+        try:
+            resultado = self._fn(self.sinais)
+        except Exception as exc:
+            self.sinais.falhou.emit(str(exc))
+        else:
+            self.sinais.terminou.emit(resultado)
 
 
-def _load_config() -> dict:
-    try:
-        with open(_CONFIG_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+def _titulo(texto: str) -> QLabel:
+    lbl = QLabel(texto)
+    lbl.setStyleSheet("font-weight: 600;")
+    return lbl
 
 
-def _save_config(data: dict):
-    try:
-        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+def _dica(texto: str) -> QLabel:
+    lbl = QLabel(texto, objectName="Dica", wordWrap=True)
+    return lbl
 
 
-class App(ttk.Window):
+class App(QMainWindow):
     def __init__(self):
-        super().__init__(themename="darkly", title="Gerador de Relatórios OAB")
-        self.resizable(False, False)
+        super().__init__()
+        self.setWindowTitle("Gerador de Relatórios OAB")
+        self.setAcceptDrops(True)
+        self.setMinimumSize(860, 560)
+
+        ico = resource_path(os.path.join("assets", "logo.ico"))
+        if os.path.exists(ico):
+            self.setWindowIcon(QIcon(ico))
 
         self._df = None
-        self._xml_path = tk.StringVar()
-        self._out_path = tk.StringVar()
-        self._count_var = tk.StringVar(value="Nenhum arquivo selecionado.")
-        self._nome_base = tk.StringVar(value="RELATORIO CADASTRO ADVOGADOS GERAL")
-        self._chk_geral = tk.BooleanVar(value=True)
-        self._chk_ativos = tk.BooleanVar(value=True)
-        self._chk_por_uf = tk.BooleanVar(value=False)
-
+        self._caminho = ""
         self._ws_names: list[str] = []
-        self._ws_var = tk.StringVar()
+        self._tarefas: set[Tarefa] = set()
+        self._dlg_carregando: DialogoCarregando | None = None
 
         self._uf_col: str | None = None
         self._valores_uf: list[str] = []
-        self._ufs_selecionadas: list[str] = []
-        self._ufs_personalizado: list[str] = []
-        self._lbl_uf_var = tk.StringVar(value="Nenhuma selecionada")
-        self._lbl_uf_pers_var = tk.StringVar(value="Nenhuma selecionada")
-
         self._comarca_col: str | None = None
         self._valores_comarca: list[str] = []
-        self._comarcas_selecionadas: list[str] = []
-        self._lbl_comarca_var = tk.StringVar(value="Nenhuma selecionada")
-        self._chk_por_comarca = tk.BooleanVar(value=False)
-
-        self._date_cols: list[str] = []
-        self._data_col_var = tk.StringVar()
-        self._data_inicio_var = tk.StringVar()
-        self._data_fim_var = tk.StringVar()
-        self._chk_filtro_data = tk.BooleanVar(value=False)
 
         self._cats_selecionadas: set[str] = set(CATEGORIAS_ATIVAS)
         self._sits_selecionadas: set[str] = set(SITUACOES_ATIVAS)
         self._cats_disponiveis: list[str] = []
         self._sits_disponiveis: list[str] = []
-        self._filtros_customizados: bool = False
+        self._filtros_customizados = False
 
-        # Relatório personalizado
-        self._chk_personalizado = tk.BooleanVar(value=False)
-        self._base_personalizado = tk.StringVar(value="ativos")  # "ativos" | "geral"
-        self._colunas_personalizado: list[str] = []
         self._cols_disponiveis: list[str] = []
-        self._lbl_colunas_var = tk.StringVar(value="Nenhuma coluna selecionada")
-        # col_nome -> lista de valores permitidos (ausente = sem filtro / todos)
+        self._colunas_personalizado: list[str] = []
         self._filtros_coluna_personalizado: dict[str, list[str]] = {}
-        self._chk_uf_personalizado = tk.BooleanVar(value=False)
 
-        # Power BI — carrega config salva; usa template bundled como padrão
-        _cfg = _load_config()
-        _tmpl_default = _cfg.get("pbix_template", "")
-        if not _tmpl_default or not os.path.isfile(_tmpl_default):
-            _tmpl_default = _PBIX_BUNDLED if os.path.isfile(_PBIX_BUNDLED) else ""
-        self._chk_powerbi = tk.BooleanVar(value=bool(_tmpl_default))
-        self._pbix_template = tk.StringVar(value=_tmpl_default)
-        self._pbix_out_path = tk.StringVar(value=_cfg.get("pbix_out_path", ""))
-        self._pbix_nome_saida = tk.StringVar(value=_cfg.get("pbix_nome_saida", ""))
+        self._sep_subsecoes: list[str] = []
+        self._sep_colunas: list[str] = []
+        self._filtros_coluna_sep: dict[str, list[str]] = {}
+        self._sep_adim_col = ""
+        self._sep_val_adimplente: list[str] = []
+        self._sep_val_inadimplente: list[str] = []
 
-        self._logo_img = None
-        self._dlg_loading: tk.Toplevel | None = None
-        self._build_ui()
-        self._center()
+        self._date_cols: list[str] = []
 
-    # ── Layout ───────────────────────────────────────────────────────────────
+        # Jovem advogado no CSV: recorte por data de compromisso
+        self._jovem_personalizado = False
+        self._jovem_anos = ANOS_JOVEM_PADRAO
+        self._jovem_desde, self._jovem_ate = periodo_jovem_padrao()
 
-    def _build_ui(self):
-        pad = {"padx": 12, "pady": 4}
+        self._linhas_log: list[tuple[str, str]] = []
 
-        # Configura fonte padrão dos widgets ttk
-        style = ttk.Style.instance
-        style.configure(".", font=("Segoe UI", 9))
-        style.configure("TLabelframe.Label", font=("Segoe UI", 9, "bold"))
-        style.configure("TButton", font=("Segoe UI", 9))
-        style.configure("TCheckbutton", font=("Segoe UI", 9))
-        # ── 1+2. Arquivo & Saída (unificado) ─────────────────────────────
-        frm1 = ttk.LabelFrame(self, text="Configuração")
-        frm1.pack(fill="x", **pad)
+        self._construir_ui()
+        self._atualizar_botoes()
+        self._dimensionar()
 
-        ttk.Label(frm1, text="Arquivo:").grid(row=0, column=0, sticky="w", padx=6, pady=3)
-        ttk.Entry(frm1, textvariable=self._xml_path, width=44, state="readonly").grid(
-            row=0, column=1, padx=4, pady=3, sticky="ew"
-        )
-        ttk.Button(frm1, text="Selecionar arquivo", command=self._selecionar_xml).grid(
-            row=0, column=2, padx=6, pady=3
-        )
+    def _dimensionar(self):
+        """Ajusta ao conteúdo, sem estourar a área útil da tela.
 
-        self._lbl_ws = ttk.Label(frm1, text="Planilha:")
-        self._cmb_ws = ttk.Combobox(frm1, textvariable=self._ws_var, state="readonly", width=34)
-        self._cmb_ws.bind("<<ComboboxSelected>>", self._on_ws_change)
+        O QScrollArea não propaga a altura do conteúdo, então sizeHint() da
+        janela ignoraria o corpo — as três faixas são somadas na mão."""
+        tela = QGuiApplication.primaryScreen().availableGeometry()
+        corpo = self._corpo_w.sizeHint()
+        alvo_altura = (self._cab.sizeHint().height() + corpo.height()
+                       + self._rod.sizeHint().height() + 8)
+        largura = max(min(corpo.width() + 40, tela.width() - 80), 900)
+        altura = max(min(alvo_altura, tela.height() - 90), 600)
+        self.resize(largura, altura)
+        quadro = self.frameGeometry()
+        quadro.moveCenter(tela.center())
+        if quadro.top() < tela.top():
+            quadro.moveTop(tela.top())
+        self.move(quadro.topLeft())
 
-        ttk.Label(frm1, text="Salvar em:").grid(row=2, column=0, sticky="w", padx=6, pady=3)
-        ttk.Entry(frm1, textvariable=self._out_path, width=44).grid(
-            row=2, column=1, padx=4, pady=3, sticky="ew"
-        )
-        ttk.Button(frm1, text="Alterar", command=self._selecionar_pasta).grid(
-            row=2, column=2, padx=6, pady=3
-        )
+    # ── Construção da interface ──────────────────────────────────────────────
 
-        ttk.Label(frm1, text="Nome base:").grid(row=3, column=0, sticky="w", padx=6, pady=3)
-        ttk.Entry(frm1, textvariable=self._nome_base, width=44).grid(
-            row=3, column=1, padx=4, pady=3, sticky="ew"
-        )
+    def _construir_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        raiz = QVBoxLayout(central)
+        raiz.setContentsMargins(0, 0, 0, 0)
+        raiz.setSpacing(0)
 
-        # ── 3. Preview inline ─────────────────────────────────────────────
-        frm3 = ttk.LabelFrame(self, text="Preview")
-        frm3.pack(fill="x", **pad)
-        ttk.Label(frm3, textvariable=self._count_var,
-                  bootstyle="info", font=("Segoe UI", 9, "bold")).pack(
-            anchor="w", padx=10, pady=5
-        )
+        self._cab = self._cabecalho()
+        raiz.addWidget(self._cab)
 
-        # ── 4. Relatórios prontos ─────────────────────────────────────────
-        frm4 = ttk.LabelFrame(self, text="1 · Relatórios prontos  (arquivo único, todas as colunas)")
-        frm4.pack(fill="x", **pad)
+        area = QScrollArea(widgetResizable=True)
+        self._corpo_w = QWidget()
+        corpo = QVBoxLayout(self._corpo_w)
+        corpo.setContentsMargins(16, 12, 16, 12)
+        corpo.setSpacing(11)
+        corpo.addWidget(self._bloco_arquivo())
+        corpo.addWidget(self._bloco_relatorios())
+        corpo.addWidget(self._bloco_data())
+        corpo.addStretch(1)
+        area.setWidget(self._corpo_w)
+        raiz.addWidget(area, 1)
 
-        ttk.Checkbutton(
-            frm4, text="Geral  —  todos os registros do arquivo",
-            variable=self._chk_geral, command=self._validar_selecao,
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 2))
+        self._rod = self._rodape()
+        raiz.addWidget(self._rod)
 
-        ttk.Checkbutton(
-            frm4, text="Apenas ativos  —  só advogados em situação regular",
-            variable=self._chk_ativos, command=self._validar_selecao,
-        ).grid(row=1, column=0, sticky="w", padx=8, pady=2)
-        self._btn_filtros = ttk.Button(
-            frm4, text="Filtros...", command=self._abrir_filtros_ativos, width=9,
-        )
-        self._btn_filtros.grid(row=1, column=1, padx=4, pady=2, sticky="w")
-        self._btn_filtros.config(state="disabled")
+    def _cabecalho(self) -> QWidget:
+        cab = QFrame(objectName="Cabecalho")
+        lin = QHBoxLayout(cab)
+        lin.setContentsMargins(20, 14, 20, 14)
 
-        ttk.Label(
-            frm4,
-            text="ℹ  Gera o arquivo com TODAS as colunas. Para escolher colunas "
-                 "específicas ou filtrar valores (seccional, município...), "
-                 "use o nº 2 abaixo.",
-            bootstyle="secondary", font=("Segoe UI", 8),
-            wraplength=560, justify="left",
-        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 6))
+        textos = QVBoxLayout()
+        textos.setSpacing(2)
+        textos.addWidget(QLabel("Gerador de Relatórios OAB", objectName="TituloApp"))
+        textos.addWidget(QLabel(
+            "Selecione o arquivo, escolha o que gerar e clique em Gerar.",
+            objectName="SubtituloApp"))
+        lin.addLayout(textos)
+        lin.addStretch(1)
 
-        # ── 5. Relatório personalizado ────────────────────────────────────
-        frm5 = ttk.LabelFrame(
-            self, text="2 · Relatório personalizado  (escolha colunas, filtros e divisão)"
-        )
-        frm5.pack(fill="x", **pad)
+        logo = resource_path(os.path.join("assets", "logo.png"))
+        if os.path.exists(logo):
+            pix = QPixmap(logo)
+            if not pix.isNull():
+                lbl = QLabel()
+                lbl.setPixmap(pix.scaledToHeight(46, Qt.SmoothTransformation))
+                lin.addWidget(lbl)
+        return cab
 
-        self._chk_personalizado_btn = ttk.Checkbutton(
-            frm5, text="Gerar relatório personalizado",
-            variable=self._chk_personalizado, command=self._validar_selecao,
-            state="disabled",
-        )
-        self._chk_personalizado_btn.grid(row=0, column=0, sticky="w", padx=8, pady=(6, 2))
+    def _bloco_arquivo(self) -> QWidget:
+        grupo = QGroupBox("1 · Arquivo de origem")
+        col = QVBoxLayout(grupo)
+        col.setSpacing(9)
 
-        self._btn_colunas = ttk.Button(
-            frm5, text="Selecionar Colunas...",
-            command=self._abrir_seletor_colunas, state="disabled",
-        )
-        self._btn_colunas.grid(row=0, column=1, padx=6, pady=(6, 2), sticky="w")
+        # QFormLayout mantém os rótulos alinhados entre si
+        form = QFormLayout()
+        form.setSpacing(9)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
-        ttk.Label(
-            frm5, textvariable=self._lbl_colunas_var,
-            bootstyle="secondary", font=("Segoe UI", 8),
-        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=28, pady=(0, 2))
+        self._ed_arquivo = QLineEdit(readOnly=True,
+                                     placeholderText="Nenhum arquivo selecionado — "
+                                                     "clique ao lado ou arraste aqui")
+        self._ed_arquivo.setProperty("somenteLeitura", "true")
+        b = QPushButton("Selecionar arquivo...")
+        b.clicked.connect(self._selecionar_arquivo)
+        form.addRow("Arquivo:", self._com_botao(self._ed_arquivo, b))
 
-        # Base (ativos x todos)
-        frm_base = ttk.Frame(frm5)
-        frm_base.grid(row=2, column=0, columnspan=3, sticky="w", padx=28, pady=(0, 2))
-        ttk.Label(frm_base, text="Base:").pack(side="left", padx=(0, 6))
-        self._rb_base_ativos = ttk.Radiobutton(
-            frm_base, text="Apenas ativos", value="ativos",
-            variable=self._base_personalizado, state="disabled",
-        )
-        self._rb_base_ativos.pack(side="left", padx=(0, 12))
-        self._rb_base_geral = ttk.Radiobutton(
-            frm_base, text="Todos", value="geral",
-            variable=self._base_personalizado, state="disabled",
-        )
-        self._rb_base_geral.pack(side="left")
+        self._cmb_planilha = QComboBox()
+        self._cmb_planilha.currentIndexChanged.connect(self._ao_trocar_planilha)
+        form.addRow("Planilha:", self._cmb_planilha)
+        self._linha_planilha = form.rowCount() - 1
+        form.setRowVisible(self._linha_planilha, False)
 
-        ttk.Label(
-            frm5,
-            text="ℹ  Para filtrar (seccional, município, situação...): clique "
-                 "“Selecionar Colunas...” e use o botão ▼ ao lado de cada coluna.",
-            bootstyle="secondary", font=("Segoe UI", 8),
-            wraplength=560, justify="left",
-        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 6))
+        self._ed_saida = QLineEdit(placeholderText="Pasta de destino dos relatórios")
+        b2 = QPushButton("Alterar...")
+        b2.clicked.connect(self._selecionar_pasta)
+        form.addRow("Salvar em:", self._com_botao(self._ed_saida, b2))
 
-        # ── 6. Filtro de Data ─────────────────────────────────────────────
-        frm_data = ttk.LabelFrame(self, text="Filtro de Data  (aplica-se a todos os relatórios)")
-        frm_data.pack(fill="x", **pad)
+        self._ed_nome = QLineEdit("RELATORIO CADASTRO ADVOGADOS GERAL")
+        form.addRow("Nome base:", self._ed_nome)
+        self._form_arquivo = form
+        col.addLayout(form)
 
-        self._chk_filtro_data_btn = ttk.Checkbutton(
-            frm_data, text="Ativar filtro de data",
-            variable=self._chk_filtro_data, command=self._toggle_filtro_data,
-            state="disabled",
-        )
-        self._chk_filtro_data_btn.grid(row=0, column=0, columnspan=6, sticky="w", padx=6, pady=(4, 2))
+        self._lbl_preview = QLabel("Nenhum arquivo selecionado.", objectName="Preview")
+        col.addWidget(self._lbl_preview)
+        return grupo
 
-        ttk.Label(frm_data, text="Coluna:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
-        self._cmb_data_col = ttk.Combobox(
-            frm_data, textvariable=self._data_col_var, state="disabled", width=22,
-        )
-        self._cmb_data_col.grid(row=1, column=1, padx=4, pady=4, sticky="w")
+    @staticmethod
+    def _com_botao(campo: QWidget, botao: QWidget) -> QWidget:
+        caixa = QWidget()
+        lin = QHBoxLayout(caixa)
+        lin.setContentsMargins(0, 0, 0, 0)
+        lin.setSpacing(8)
+        lin.addWidget(campo, 1)
+        lin.addWidget(botao)
+        return caixa
 
-        ttk.Label(frm_data, text="De:").grid(row=1, column=2, sticky="w", padx=(14, 2), pady=4)
-        self._ent_data_inicio = ttk.Entry(frm_data, textvariable=self._data_inicio_var, width=12, state="disabled")
-        self._ent_data_inicio.grid(row=1, column=3, padx=2, pady=4)
-        ttk.Label(frm_data, text="Até:").grid(row=1, column=4, sticky="w", padx=(10, 2), pady=4)
-        self._ent_data_fim = ttk.Entry(frm_data, textvariable=self._data_fim_var, width=12, state="disabled")
-        self._ent_data_fim.grid(row=1, column=5, padx=2, pady=4)
-        ttk.Label(
-            frm_data, text="formato: dd/mm/aaaa",
-            bootstyle="secondary", font=("Segoe UI", 7),
-        ).grid(row=2, column=1, columnspan=5, sticky="w", padx=4, pady=(0, 3))
+    def _bloco_relatorios(self) -> QWidget:
+        grupo = QGroupBox("2 · O que gerar")
+        col = QVBoxLayout(grupo)
 
-        # ── 7. Power BI ───────────────────────────────────────────────────
-        frm_pbi = ttk.LabelFrame(self, text="Power BI  (opcional)")
-        frm_pbi.pack(fill="x", **pad)
+        self._abas = QTabWidget()
+        self._abas.addTab(self._aba_prontos(), "Relatórios prontos")
+        self._abas.addTab(self._aba_personalizado(), "Personalizado")
+        self._abas.addTab(self._aba_subsecao(), "Por subseção")
+        self._abas.addTab(self._aba_csv(), "CSV OAB-MA")
+        # O painel acompanha a altura da aba atual. Sem isto o QTabWidget
+        # reserva a altura da maior aba e sobra um vazio nas demais.
+        self._abas.currentChanged.connect(self._ajustar_altura_aba)
+        self._ajustar_altura_aba(0)
+        col.addWidget(self._abas)
+        return grupo
 
-        self._chk_pbi_btn = ttk.Checkbutton(
-            frm_pbi, text="Atualizar arquivo Power BI ao gerar",
-            variable=self._chk_powerbi, command=self._toggle_powerbi,
-        )
-        self._chk_pbi_btn.grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(6, 2))
+    def _ajustar_altura_aba(self, atual: int):
+        """Fixa o painel na altura da aba atual.
 
-        ttk.Label(frm_pbi, text="Template .pbix:").grid(row=1, column=0, sticky="w", padx=6, pady=3)
-        self._ent_pbix_template = ttk.Entry(
-            frm_pbi, textvariable=self._pbix_template, width=38, state="disabled",
-        )
-        self._ent_pbix_template.grid(row=1, column=1, padx=4, pady=3, sticky="ew")
-        self._btn_pbix_sel = ttk.Button(
-            frm_pbi, text="Selecionar...", command=self._selecionar_pbix, state="disabled", width=12,
-        )
-        self._btn_pbix_sel.grid(row=1, column=2, padx=6, pady=3)
+        Só marcar as outras páginas como Ignored não basta: o QTabWidget mantém
+        o sizeHint da maior página, sobrando um vazio nas abas curtas."""
+        for i in range(self._abas.count()):
+            self._abas.widget(i).setSizePolicy(
+                QSizePolicy.Preferred,
+                QSizePolicy.Preferred if i == atual else QSizePolicy.Ignored)
+        pagina = self._abas.widget(atual)
+        pagina.adjustSize()
+        self._abas.setFixedHeight(
+            pagina.sizeHint().height()
+            + self._abas.tabBar().sizeHint().height() + 18)
 
-        ttk.Label(frm_pbi, text="Salvar .pbix em:").grid(row=2, column=0, sticky="w", padx=6, pady=3)
-        self._ent_pbix_out = ttk.Entry(
-            frm_pbi, textvariable=self._pbix_out_path, width=38, state="disabled",
-        )
-        self._ent_pbix_out.grid(row=2, column=1, padx=4, pady=3, sticky="ew")
-        self._btn_pbix_out = ttk.Button(
-            frm_pbi, text="Alterar", command=self._selecionar_pbix_pasta, state="disabled", width=12,
-        )
-        self._btn_pbix_out.grid(row=2, column=2, padx=6, pady=3)
+    def _aba_prontos(self) -> QWidget:
+        w = QWidget()
+        col = QVBoxLayout(w)
+        col.setContentsMargins(14, 14, 14, 14)
+        col.setSpacing(8)
 
-        ttk.Label(frm_pbi, text="Nome do arquivo:").grid(row=3, column=0, sticky="w", padx=6, pady=3)
-        self._ent_pbix_nome = ttk.Entry(
-            frm_pbi, textvariable=self._pbix_nome_saida, width=38, state="disabled",
-        )
-        self._ent_pbix_nome.grid(row=3, column=1, padx=4, pady=(3, 6), sticky="ew")
-        ttk.Label(
-            frm_pbi, text="(vazio = data + nome do template)",
-            bootstyle="secondary", font=("Segoe UI", 7),
-        ).grid(row=3, column=2, sticky="w", padx=6)
+        self._chk_geral = QCheckBox("Geral — todos os registros do arquivo")
+        self._chk_geral.setChecked(True)
+        self._chk_geral.toggled.connect(self._atualizar_botoes)
+        col.addWidget(self._chk_geral)
 
-        # ── 8. Barra de progresso ─────────────────────────────────────────
-        frm_prog = ttk.Frame(self)
-        frm_prog.pack(fill="x", padx=12, pady=(2, 0))
-        self._progress = ttk.Progressbar(
-            frm_prog, mode="determinate", maximum=100, bootstyle="info-striped",
-        )
-        self._progress.pack(fill="x")
+        lin = QHBoxLayout()
+        self._chk_ativos = QCheckBox("Apenas ativos — só advogados em situação regular")
+        self._chk_ativos.setChecked(True)
+        self._chk_ativos.toggled.connect(self._atualizar_botoes)
+        lin.addWidget(self._chk_ativos)
+        self._btn_filtros = QPushButton("Filtros...")
+        self._btn_filtros.setEnabled(False)
+        self._btn_filtros.clicked.connect(self._abrir_filtros_ativos)
+        lin.addWidget(self._btn_filtros)
+        lin.addStretch(1)
+        col.addLayout(lin)
 
-        # ── 8. Botão Gerar ────────────────────────────────────────────────
-        frm_btn = ttk.Frame(self)
-        frm_btn.pack(fill="x", padx=12, pady=6)
-        style = ttk.Style.instance
-        style.configure("Gerar.success.TButton",
-                        font=("Segoe UI", 11, "bold"), padding=(20, 10))
-        self._btn_gerar = ttk.Button(
-            frm_btn,
-            text="▶   Gerar Relatórios",
-            command=self._gerar,
-            style="Gerar.success.TButton",
-            cursor="hand2",
-        )
-        self._btn_gerar.pack(fill="x")
+        self._chk_estagiarios = QCheckBox("+ Incluir estagiários no filtro de ativos")
+        self._chk_estagiarios.setEnabled(False)
+        self._chk_estagiarios.toggled.connect(self._ao_alternar_estagiarios)
+        col.addWidget(self._chk_estagiarios)
 
-        # ── 9. Log ────────────────────────────────────────────────────────
-        frm_log = ttk.LabelFrame(self, text="Log")
-        frm_log.pack(fill="both", expand=True, padx=12, pady=5)
-        self._log = ScrolledText(
-            frm_log, height=8, state="disabled",
-            font=("Consolas", 9), wrap="word",
-            bg=_LOG["bg"], fg=_LOG["fg"],
-            insertbackground=_LOG["fg"],
-            relief="flat", bd=0,
-        )
-        self._log.pack(fill="both", expand=True, padx=4, pady=4)
-        self._log.tag_config("ok",     foreground=_LOG["ok"])
-        self._log.tag_config("erro",   foreground=_LOG["err"])
-        self._log.tag_config("info",   foreground=_LOG["info"])
-        self._log.tag_config("normal", foreground=_LOG["fg"])
+        self._lbl_estagiarios = _dica("")
+        col.addWidget(self._lbl_estagiarios)
 
-        self.geometry("680x960")
+        col.addWidget(_dica(
+            "Sai com todas as colunas. Para escolher colunas ou filtrar valores, "
+            "use a aba Personalizado."))
 
-        # Aplica estado inicial do Power BI baseado no config carregado
-        self.after(100, self._toggle_powerbi)
+        self._btn_prontos = QPushButton("▶  Gerar relatórios prontos",
+                                        objectName="Acao")
+        self._btn_prontos.setEnabled(False)
+        self._btn_prontos.clicked.connect(self._gerar_prontos)
+        col.addWidget(self._btn_prontos, 0, Qt.AlignLeft)
+        col.addStretch(1)
+        return w
 
-    def _center(self):
-        self.update_idletasks()
-        w, h = self.winfo_width(), self.winfo_height()
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+    def _aba_personalizado(self) -> QWidget:
+        w = QWidget()
+        col = QVBoxLayout(w)
+        col.setContentsMargins(14, 14, 14, 14)
+        col.setSpacing(8)
 
-    # ── Tela de carregamento ──────────────────────────────────────────────────
+        lin = QHBoxLayout()
+        self._btn_colunas = QPushButton("Selecionar colunas...")
+        self._btn_colunas.setEnabled(False)
+        self._btn_colunas.clicked.connect(self._abrir_seletor_colunas)
+        lin.addWidget(self._btn_colunas)
+        lin.addStretch(1)
+        col.addLayout(lin)
 
-    def _mostrar_carregando(self, msg: str = "Carregando..."):
-        if self._dlg_loading:
+        self._lbl_colunas = _dica("Nenhuma coluna selecionada")
+        col.addWidget(self._lbl_colunas)
+
+        lin2 = QHBoxLayout()
+        lin2.addWidget(QLabel("Base:"))
+        self._rb_pers_ativos = QRadioButton("Apenas ativos")
+        self._rb_pers_ativos.setChecked(True)
+        self._rb_pers_ativos.setEnabled(False)
+        self._rb_pers_ativos.toggled.connect(self._ao_trocar_base_personalizado)
+        self._rb_pers_todos = QRadioButton("Todos")
+        self._rb_pers_todos.setEnabled(False)
+        lin2.addWidget(self._rb_pers_ativos)
+        lin2.addWidget(self._rb_pers_todos)
+        lin2.addStretch(1)
+        col.addLayout(lin2)
+
+        self._chk_estagiarios_pers = QCheckBox("+ Incluir estagiários no filtro de ativos")
+        self._chk_estagiarios_pers.setEnabled(False)
+        self._chk_estagiarios_pers.toggled.connect(self._ao_alternar_estagiarios_pers)
+        col.addWidget(self._chk_estagiarios_pers)
+
+        self._lbl_estagiarios_pers = _dica("")
+        col.addWidget(self._lbl_estagiarios_pers)
+
+        col.addWidget(_dica(
+            "Para filtrar valores: em “Selecionar colunas...”, destaque a coluna "
+            "e use “Filtrar valores...”."))
+
+        self._btn_pers = QPushButton("▶  Gerar relatório personalizado",
+                                     objectName="Acao")
+        self._btn_pers.setEnabled(False)
+        self._btn_pers.clicked.connect(self._gerar_personalizado)
+        col.addWidget(self._btn_pers, 0, Qt.AlignLeft)
+        col.addStretch(1)
+        return w
+
+    def _aba_subsecao(self) -> QWidget:
+        w = QWidget()
+        col = QVBoxLayout(w)
+        col.setContentsMargins(14, 14, 14, 14)
+        col.setSpacing(8)
+
+        lin = QHBoxLayout()
+        self._btn_sep_subsecoes = QPushButton("Selecionar subseções...")
+        self._btn_sep_subsecoes.setEnabled(False)
+        self._btn_sep_subsecoes.clicked.connect(self._abrir_seletor_subsecoes)
+        lin.addWidget(self._btn_sep_subsecoes)
+        self._btn_sep_colunas = QPushButton("Selecionar colunas...")
+        self._btn_sep_colunas.setEnabled(False)
+        self._btn_sep_colunas.clicked.connect(self._abrir_seletor_colunas_sep)
+        lin.addWidget(self._btn_sep_colunas)
+        lin.addStretch(1)
+        col.addLayout(lin)
+
+        self._lbl_sep_sub = _dica("Nenhuma subseção selecionada")
+        self._lbl_sep_col = _dica("Todas as colunas")
+        col.addWidget(self._lbl_sep_sub)
+        col.addWidget(self._lbl_sep_col)
+
+        lin2 = QHBoxLayout()
+        self._chk_sep_adim = QCheckBox(
+            "Separar cada subseção em adimplentes × inadimplentes")
+        self._chk_sep_adim.setEnabled(False)
+        self._chk_sep_adim.toggled.connect(self._ao_alternar_separar_adim)
+        lin2.addWidget(self._chk_sep_adim)
+        self._btn_sep_adim = QPushButton("Adimplência...")
+        self._btn_sep_adim.clicked.connect(self._abrir_config_adimplencia)
+        self._btn_sep_adim.hide()
+        lin2.addWidget(self._btn_sep_adim)
+        lin2.addStretch(1)
+        col.addLayout(lin2)
+
+        self._lbl_sep_adim = _dica("Adimplência não configurada")
+        col.addWidget(self._lbl_sep_adim)
+
+        lin3 = QHBoxLayout()
+        lin3.addWidget(QLabel("Base:"))
+        self._rb_sep_ativos = QRadioButton("Apenas ativos")
+        self._rb_sep_ativos.setEnabled(False)
+        self._rb_sep_todos = QRadioButton("Todos")
+        self._rb_sep_todos.setChecked(True)
+        self._rb_sep_todos.setEnabled(False)
+        lin3.addWidget(self._rb_sep_ativos)
+        lin3.addWidget(self._rb_sep_todos)
+        lin3.addStretch(1)
+        col.addLayout(lin3)
+
+        col.addWidget(_dica(
+            "1 arquivo por subseção. Sem seleção, gera todas."))
+
+        self._btn_separados = QPushButton("▶  Gerar relatórios separados",
+                                          objectName="Acao")
+        self._btn_separados.setEnabled(False)
+        self._btn_separados.clicked.connect(self._gerar_separados_click)
+        col.addWidget(self._btn_separados, 0, Qt.AlignLeft)
+        col.addStretch(1)
+        return w
+
+    def _aba_csv(self) -> QWidget:
+        w = QWidget()
+        col = QVBoxLayout(w)
+        col.setContentsMargins(14, 14, 14, 14)
+        col.setSpacing(8)
+
+        lin = QHBoxLayout()
+        self._btn_csv_mapa = QPushButton("Ver mapeamento...")
+        self._btn_csv_mapa.setEnabled(False)
+        self._btn_csv_mapa.clicked.connect(self._abrir_mapeamento_csv)
+        lin.addWidget(self._btn_csv_mapa)
+        lin.addStretch(1)
+        col.addLayout(lin)
+
+        lin2 = QHBoxLayout()
+        lin2.addWidget(QLabel("Base:"))
+        self._rb_csv_ativos = QRadioButton("Apenas ativos")
+        self._rb_csv_ativos.setChecked(True)
+        self._rb_csv_ativos.setEnabled(False)
+        self._rb_csv_todos = QRadioButton("Todos")
+        self._rb_csv_todos.setEnabled(False)
+        lin2.addWidget(self._rb_csv_ativos)
+        lin2.addWidget(self._rb_csv_todos)
+        lin2.addStretch(1)
+        col.addLayout(lin2)
+
+        lin3 = QHBoxLayout()
+        self._btn_csv_jovem = QPushButton("Jovem advogado...")
+        self._btn_csv_jovem.setToolTip(
+            "Período de compromisso que conta como jovem advogado")
+        self._btn_csv_jovem.setEnabled(False)
+        self._btn_csv_jovem.clicked.connect(self._abrir_config_jovem)
+        lin3.addWidget(self._btn_csv_jovem)
+        lin3.addStretch(1)
+        col.addLayout(lin3)
+
+        self._lbl_csv_adim = _dica("")
+        self._lbl_csv_jovem = _dica("")
+        col.addWidget(self._lbl_csv_adim)
+        col.addWidget(self._lbl_csv_jovem)
+
+        col.addWidget(_dica(
+            "CSV com as 20 colunas do layout de importação. O mapeamento das "
+            "colunas é automático — confira antes de importar."))
+
+        self._btn_csv = QPushButton("▶  Gerar CSV de importação", objectName="Acao")
+        self._btn_csv.setEnabled(False)
+        self._btn_csv.clicked.connect(self._gerar_csv)
+        col.addWidget(self._btn_csv, 0, Qt.AlignLeft)
+        col.addStretch(1)
+        return w
+
+    def _bloco_data(self) -> QWidget:
+        grupo = QGroupBox("Filtro de data  ·  aplica-se a todos os relatórios")
+        col = QVBoxLayout(grupo)
+        col.setSpacing(8)
+
+        lin = QHBoxLayout()
+        self._chk_data = QCheckBox("Ativar filtro de data")
+        self._chk_data.setEnabled(False)
+        self._chk_data.toggled.connect(self._alternar_filtro_data)
+        lin.addWidget(self._chk_data)
+        lin.addSpacing(14)
+
+        lin.addWidget(QLabel("Coluna:"))
+        self._cmb_data = QComboBox()
+        self._cmb_data.setEnabled(False)
+        self._cmb_data.setMinimumWidth(200)
+        lin.addWidget(self._cmb_data)
+
+        lin.addSpacing(12)
+        lin.addWidget(QLabel("De:"))
+        self._data_de = self._campo_data()
+        lin.addWidget(self._data_de)
+        lin.addWidget(QLabel("Até:"))
+        self._data_ate = self._campo_data()
+        lin.addWidget(self._data_ate)
+        lin.addStretch(1)
+        col.addLayout(lin)
+
+        col.addWidget(_dica(
+            "Deixe em “— sem limite —” para filtrar só por um lado."))
+        return grupo
+
+    @staticmethod
+    def _campo_data() -> QDateEdit:
+        ed = QDateEdit()
+        ed.setEnabled(False)
+        ed.setCalendarPopup(True)
+        ed.setDisplayFormat("dd/MM/yyyy")
+        ed.setMinimumDate(_DATA_SENTINELA)
+        ed.setSpecialValueText("— sem limite —")
+        ed.setDate(_DATA_SENTINELA)
+        return ed
+
+    def _rodape(self) -> QWidget:
+        rod = QFrame(objectName="Rodape")
+        col = QVBoxLayout(rod)
+        col.setContentsMargins(18, 10, 18, 12)
+        col.setSpacing(7)
+
+        topo = QHBoxLayout()
+        self._lbl_status = QLabel(objectName="Status")
+        topo.addWidget(self._lbl_status)
+        topo.addStretch(1)
+        self._btn_log = QPushButton("Ocultar log", objectName="Link")
+        self._btn_log.clicked.connect(self._alternar_log)
+        topo.addWidget(self._btn_log)
+        col.addLayout(topo)
+
+        self._barra = QProgressBar(maximum=100, value=0, textVisible=False)
+        col.addWidget(self._barra)
+
+        self._log = QPlainTextEdit(objectName="Log", readOnly=True)
+        self._log.setFixedHeight(_ALTURA_LOG)
+        self._log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        col.addWidget(self._log)
+
+        credito = QLabel("created by andrelima-dev", objectName="Credito")
+        credito.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        col.addWidget(credito)
+        return rod
+
+    def _alternar_log(self):
+        mostrando = not self._log.isVisible()
+        self._log.setVisible(mostrando)
+        self._btn_log.setText("Ocultar log" if mostrando else "Mostrar log")
+        if self.isMaximized() or self.isFullScreen():
             return
-        s = ttk.Style.instance
-        bg     = s.colors.bg
-        surface = s.colors.selectbg
-        fg     = s.colors.fg
-        accent = s.colors.info
+        # Sem encolher a janela junto, o espaco liberado viraria um vazio
+        delta = _ALTURA_LOG + self._rod.layout().spacing()
+        self.resize(self.width(),
+                    max(self.height() + (delta if mostrando else -delta),
+                        self.minimumHeight()))
 
-        dlg = tk.Toplevel(self)
-        dlg.overrideredirect(True)
-        dlg.configure(bg=accent)
-        dlg.attributes("-topmost", True)
+    # ── Arrastar e soltar ────────────────────────────────────────────────────
 
-        borda = tk.Frame(dlg, bg=accent, padx=1, pady=1)
-        borda.pack(fill="both", expand=True)
-        body = tk.Frame(borda, bg=bg)
-        body.pack(fill="both", expand=True)
+    def dragEnterEvent(self, evento):
+        urls = evento.mimeData().urls()
+        if urls and urls[0].toLocalFile().lower().endswith(
+                (".xml", ".xlsx", ".xlsm", ".xls")):
+            evento.acceptProposedAction()
 
-        tk.Label(body, text="⏳", font=("Segoe UI Emoji", 20), bg=bg).pack(pady=(16, 2))
+    def dropEvent(self, evento):
+        urls = evento.mimeData().urls()
+        if urls:
+            self._carregar(urls[0].toLocalFile())
 
-        self._loading_msg_var = tk.StringVar(value=msg)
-        tk.Label(
-            body, textvariable=self._loading_msg_var,
-            font=("Segoe UI", 9, "bold"), fg=accent, bg=bg,
-        ).pack(padx=32, pady=(0, 6))
+    # ── Carregamento do arquivo ──────────────────────────────────────────────
 
-        self._loading_pb = ttk.Progressbar(
-            body, mode="determinate", maximum=100, length=240, bootstyle="info-striped",
+    def _selecionar_arquivo(self):
+        caminho, _ = QFileDialog.getOpenFileName(
+            self, "Selecionar arquivo (XML ou Excel)", "",
+            "Planilhas (*.xml *.xlsx *.xlsm);;XML (*.xml);;"
+            "Excel (*.xlsx *.xlsm);;Todos os arquivos (*)",
         )
-        self._loading_pb.pack(padx=24, pady=(0, 4))
+        if caminho:
+            self._carregar(caminho)
 
-        self._loading_pct_var = tk.StringVar(value="0%")
-        tk.Label(
-            body, textvariable=self._loading_pct_var,
-            font=("Segoe UI", 8), fg=fg, bg=bg,
-        ).pack(pady=(0, 16))
+    def _selecionar_pasta(self):
+        pasta = QFileDialog.getExistingDirectory(self, "Selecionar pasta de saída")
+        if pasta:
+            self._ed_saida.setText(pasta)
 
-        dlg.update_idletasks()
-        w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
-        x = self.winfo_x() + (self.winfo_width() - w) // 2
-        y = self.winfo_y() + (self.winfo_height() - h) // 2
-        dlg.geometry(f"{w}x{h}+{x}+{y}")
-        dlg.update()
-        self._dlg_loading = dlg
-
-    def _set_loading_progress(self, pct: int):
-        if self._dlg_loading and hasattr(self, "_loading_pb"):
-            self._loading_pb["value"] = pct
-            self._loading_pct_var.set(f"{pct}%")
-            self._dlg_loading.update_idletasks()
-
-    def _atualizar_carregando(self, msg: str):
-        if hasattr(self, "_loading_msg_var") and self._loading_msg_var:
-            self._loading_msg_var.set(msg)
+    def _mostrar_carregando(self, msg: str):
+        if self._dlg_carregando is None:
+            self._dlg_carregando = DialogoCarregando(self, msg)
+            self._dlg_carregando.show()
+        else:
+            self._dlg_carregando.definir_mensagem(msg)
 
     def _esconder_carregando(self):
-        if self._dlg_loading:
-            try:
-                self._dlg_loading.destroy()
-            except Exception:
-                pass
-            self._dlg_loading = None
+        if self._dlg_carregando is not None:
+            self._dlg_carregando.close()
+            self._dlg_carregando = None
 
-    # ── Selecionar XML ────────────────────────────────────────────────────────
+    def _iniciar(self, fn, ao_terminar, ao_falhar):
+        # A Tarefa precisa continuar referenciada enquanto roda: se o coletor a
+        # levar, o _Sinais morre junto e a thread quebra ao emitir progresso.
+        tarefa = Tarefa(fn)
+        self._tarefas.add(tarefa)
+        soltar = lambda *_: self._tarefas.discard(tarefa)  # noqa: E731
+        tarefa.sinais.terminou.connect(ao_terminar)
+        tarefa.sinais.falhou.connect(ao_falhar)
+        tarefa.sinais.terminou.connect(soltar)
+        tarefa.sinais.falhou.connect(soltar)
+        QThreadPool.globalInstance().start(tarefa)
+        return tarefa
 
-    def _selecionar_xml(self):
-        path = filedialog.askopenfilename(
-            title="Selecionar arquivo (XML ou Excel)",
-            filetypes=[
-                ("Planilhas (XML/Excel)", "*.xml *.xlsx *.xlsm"),
-                ("Arquivos XML", "*.xml"),
-                ("Arquivos Excel", "*.xlsx *.xlsm"),
-                ("Todos", "*.*"),
-            ],
-        )
-        if not path:
-            return
+    def showEvent(self, evento):
+        super().showEvent(evento)
+        # Só depois do primeiro layout real a página tem tamanho definitivo
+        self._ajustar_altura_aba(self._abas.currentIndex())
 
-        self._mostrar_carregando("Carregando arquivo...")
-        self._count_var.set("Carregando...")
-        self._log_clear()
+    def closeEvent(self, evento):
+        # Fechar com tarefa em voo destruiria os sinais que ela ainda usa
+        pool = QThreadPool.globalInstance()
+        if pool.activeThreadCount():
+            pool.waitForDone(5000)
+        super().closeEvent(evento)
+
+    def _carregar(self, caminho: str, ws_idx: int = 0, trocando_planilha: bool = False):
+        self._caminho = caminho
         self._df = None
+        self._log_limpar()
+        self._lbl_preview.setText("Carregando...")
+        self._mostrar_carregando(
+            "Carregando planilha..." if trocando_planilha else "Carregando arquivo...")
 
-        def _task():
-            def progress(pct: int):
-                self.after(0, lambda p=pct: self._set_loading_progress(p))
-            try:
-                nomes, df = carregar_planilha(path, progress_cb=progress)
-                self.after(0, lambda: self._apos_carregar_xml(path, nomes, df))
-            except Exception as exc:
-                self.after(0, self._esconder_carregando)
-                self.after(0, lambda: messagebox.showerror("Arquivo inválido", str(exc)))
-                self.after(0, lambda: self._count_var.set("Erro ao carregar."))
+        def _trabalho(sinais):
+            return carregar_planilha(caminho, ws_idx,
+                                     progress_cb=sinais.progresso.emit)
 
-        threading.Thread(target=_task, daemon=True).start()
+        tarefa = self._iniciar(
+            _trabalho,
+            lambda r: self._ao_carregar_ok(caminho, r, trocando_planilha),
+            self._ao_carregar_erro,
+        )
+        tarefa.sinais.progresso.connect(self._progresso_carregando)
 
-    def _apos_carregar_xml(self, path: str, nomes: list[str], df):
-        self._xml_path.set(path)
-        if not self._out_path.get():
-            self._out_path.set(os.path.dirname(path))
+    def _progresso_carregando(self, pct: int):
+        if self._dlg_carregando is not None:
+            self._dlg_carregando.definir_progresso(pct)
 
-        self._ws_names = nomes
-        self._ws_var.set(nomes[0])
-
-        if len(nomes) > 1:
-            self._cmb_ws["values"] = nomes
-            self._lbl_ws.grid(row=1, column=0, sticky="w", padx=6, pady=3)
-            self._cmb_ws.grid(row=1, column=1, columnspan=2, padx=4, pady=3, sticky="w")
-        else:
-            self._lbl_ws.grid_remove()
-            self._cmb_ws.grid_remove()
-
-        self._df = df
+    def _ao_carregar_erro(self, msg: str):
         self._esconder_carregando()
-        self._apos_carregar(df)
+        self._lbl_preview.setText("Erro ao carregar.")
+        self._log_append(f"Erro: {msg}", "erro")
+        QMessageBox.critical(self, "Arquivo inválido", msg)
 
-    def _on_ws_change(self, _event=None):
-        path = self._xml_path.get()
-        if not path:
-            return
-        ws_idx = (
-            self._ws_names.index(self._ws_var.get())
-            if self._ws_var.get() in self._ws_names
-            else 0
-        )
-        self._mostrar_carregando("Carregando planilha...")
-        self._count_var.set("Carregando...")
-        self._log_clear()
-        self._df = None
+    def _ao_carregar_ok(self, caminho, resultado, trocando_planilha: bool):
+        nomes, df = resultado
+        self._esconder_carregando()
+        self._ed_arquivo.setText(caminho)
+        if not self._ed_saida.text().strip():
+            self._ed_saida.setText(os.path.dirname(caminho))
 
-        def _task():
-            try:
-                _, df = carregar_planilha(path, ws_idx)
-                self.after(0, self._esconder_carregando)
-                self.after(0, lambda: self._apos_ws_change(df))
-            except Exception as exc:
-                self.after(0, self._esconder_carregando)
-                self.after(0, lambda: self._log_append(f"Erro: {exc}", "erro"))
+        if not trocando_planilha:
+            self._ws_names = nomes
+            self._cmb_planilha.blockSignals(True)
+            self._cmb_planilha.clear()
+            self._cmb_planilha.addItems(nomes)
+            self._cmb_planilha.blockSignals(False)
+            self._form_arquivo.setRowVisible(self._linha_planilha,
+                                             len(nomes) > 1)
 
-        threading.Thread(target=_task, daemon=True).start()
-
-    def _apos_ws_change(self, df):
         self._df = df
         self._apos_carregar(df)
+
+    def _ao_trocar_planilha(self, idx: int):
+        if idx < 0 or not self._caminho:
+            return
+        self._carregar(self._caminho, idx, trocando_planilha=True)
+
+    # ── Após carregar ────────────────────────────────────────────────────────
 
     def _apos_carregar(self, df):
         total = len(df)
-
         col_cat = get_col(df, "CATEGORIA")
         col_sit = get_col(df, "SITUACAO_INSCRICAO")
+
         if col_cat and col_sit:
             mask = (
-                df[col_cat].str.strip().str.upper().isin({c.upper() for c in CATEGORIAS_ATIVAS})
-                & df[col_sit].str.strip().str.upper().isin({s.upper() for s in SITUACOES_ATIVAS})
+                df[col_cat].str.strip().str.upper().isin(
+                    {c.upper() for c in CATEGORIAS_ATIVAS})
+                & df[col_sit].str.strip().str.upper().isin(
+                    {s.upper() for s in SITUACOES_ATIVAS})
             )
-            ativos = int(mask.sum())
-            self._count_var.set(f"{total} registros carregados  |  Ativos: {ativos}")
+            self._lbl_preview.setText(
+                f"{total} registros carregados   ·   Ativos: {int(mask.sum())}   ·   "
+                f"{len(df.columns)} colunas")
         else:
-            self._count_var.set(f"{total} registros carregados")
+            self._lbl_preview.setText(
+                f"{total} registros carregados   ·   {len(df.columns)} colunas")
 
         self._log_append(f"{total} registros carregados", "ok")
 
-        if col_cat:
-            self._cats_disponiveis = sorted(
-                df[col_cat].str.strip().str.upper().dropna().unique().tolist()
-            )
-        if col_sit:
-            self._sits_disponiveis = sorted(
-                df[col_sit].str.strip().str.upper().dropna().unique().tolist()
-            )
+        self._cats_disponiveis = (
+            sorted(df[col_cat].str.strip().str.upper().dropna().unique().tolist())
+            if col_cat else [])
+        self._sits_disponiveis = (
+            sorted(df[col_sit].str.strip().str.upper().dropna().unique().tolist())
+            if col_sit else [])
 
-        self._btn_filtros.config(
-            state="normal" if (col_cat or col_sit) else "disabled"
-        )
+        self._btn_filtros.setEnabled(bool(col_cat or col_sit))
+        self._chk_estagiarios.setEnabled(bool(col_cat))
+        self._chk_estagiarios_pers.setEnabled(
+            bool(col_cat) and self._rb_pers_ativos.isChecked())
+        self._ao_alternar_estagiarios()
 
-        # Colunas disponíveis para o relatório personalizado
         self._cols_disponiveis = list(df.columns)
         self._colunas_personalizado = []
         self._filtros_coluna_personalizado = {}
-        self._lbl_colunas_var.set("Nenhuma coluna selecionada")
-        self._chk_personalizado_btn.config(state="normal")
-        self._btn_colunas.config(state="normal")
-        self._rb_base_ativos.config(state="normal")
-        self._rb_base_geral.config(state="normal")
+        self._lbl_colunas.setText("Nenhuma coluna selecionada")
 
-        # Detecção automática da coluna de seccional
+        for w in (self._btn_colunas, self._rb_pers_ativos, self._rb_pers_todos,
+                  self._btn_sep_subsecoes, self._btn_sep_colunas,
+                  self._chk_sep_adim, self._rb_sep_ativos, self._rb_sep_todos,
+                  self._btn_csv_mapa, self._rb_csv_ativos, self._rb_csv_todos,
+                  self._btn_csv_jovem):
+            w.setEnabled(True)
+
+        self._sep_subsecoes = []
+        self._sep_colunas = []
+        self._filtros_coluna_sep = {}
+        self._sep_adim_col = self._detectar_col_adimplencia(df) or ""
+        if self._sep_adim_col:
+            self._sep_val_adimplente, self._sep_val_inadimplente = (
+                self._classificar_adimplencia(
+                    self._valores_da_coluna(self._sep_adim_col)))
+        else:
+            self._sep_val_adimplente, self._sep_val_inadimplente = [], []
+
         self._uf_col = self._detectar_col_subsecao(df)
         if self._uf_col:
-            primeiros = sorted(
-                str(v).strip() for v in df[self._uf_col].dropna().unique() if str(v).strip()
-            )[:5]
+            self._valores_uf = self._valores_da_coluna(self._uf_col)
             self._log_append(
-                f"Seccional → coluna '{self._uf_col}'  "
-                f"(ex: {', '.join(primeiros)}...)",
-                "info",
-            )
-            self._popular_valores_uf(df, self._uf_col)
+                f"Subseção → coluna '{self._uf_col}'  "
+                f"(ex: {', '.join(self._valores_uf[:5])}...)", "info")
         else:
-            self._log_append("Coluna de seccional não detectada no arquivo.", "normal")
-            self._ufs_selecionadas = []
-            self._lbl_uf_var.set("Nenhuma selecionada")
-            self._ufs_personalizado = []
-            self._lbl_uf_pers_var.set("Nenhuma selecionada")
+            self._valores_uf = []
+            self._log_append("Coluna de subseção não detectada no arquivo.", "normal")
 
-        # Detecção automática da coluna de município
         self._comarca_col = self._detectar_col_comarca(df)
         if self._comarca_col:
-            primeiros_c = sorted(
-                str(v).strip() for v in df[self._comarca_col].dropna().unique() if str(v).strip()
-            )[:5]
+            self._valores_comarca = self._valores_da_coluna(self._comarca_col)
             self._log_append(
                 f"Município → coluna '{self._comarca_col}'  "
-                f"(ex: {', '.join(primeiros_c)}...)",
-                "info",
-            )
-            self._popular_valores_comarca(df, self._comarca_col)
+                f"(ex: {', '.join(self._valores_comarca[:5])}...)", "info")
         else:
-            self._comarcas_selecionadas = []
-            self._lbl_comarca_var.set("Nenhuma selecionada")
+            self._valores_comarca = []
 
-        # Detectar colunas de data
+        self._atualizar_lbls_sep()
+        self._atualizar_lbls_csv()
+
         self._date_cols = [c for c in df.columns if is_date_col(c)]
-        if self._date_cols:
-            self._cmb_data_col["values"] = self._date_cols
-            self._data_col_var.set(self._date_cols[0])
-            self._chk_filtro_data_btn.config(state="normal")
-        else:
-            self._chk_filtro_data.set(False)
-            self._chk_filtro_data_btn.config(state="disabled")
-        self._toggle_filtro_data()
+        self._cmb_data.clear()
+        self._cmb_data.addItems(self._date_cols)
+        self._chk_data.setEnabled(bool(self._date_cols))
+        if not self._date_cols:
+            self._chk_data.setChecked(False)
+        self._alternar_filtro_data()
+
+        self._atualizar_botoes()
+
+    # ── Detecção de colunas ──────────────────────────────────────────────────
 
     @staticmethod
     def _detectar_col_subsecao(df):
-        def skip(col: str) -> bool:
+        def pular(col: str) -> bool:
             u = col.strip().upper()
             partes = {"BAIRRO", "LOGR", "CEP", "COMP", "EXIBE", "DT_", "DATA_",
                       "FONE", "EMAIL", "CPF", "RG", "NASC", "SEXO", "NUM_",
@@ -625,823 +829,621 @@ class App(ttk.Window):
                 return col
 
         for col in df.columns:
-            if skip(col):
+            if pular(col):
                 continue
             u = col.strip().upper()
             if "SUBSEC" in u or "SECCIONAL" in u:
                 return col
 
-        best_col, best_score = None, -1
+        melhor, melhor_score = None, -1
         for col in df.columns:
-            if skip(col):
+            if pular(col):
                 continue
             vals = [str(v).strip() for v in df[col].dropna().unique() if str(v).strip()]
             n = len(vals)
             if n < 5 or n > 45:
                 continue
-            avg_len = sum(len(v) for v in vals[:30]) / min(len(vals), 30)
-            if avg_len <= 3:
+            media = sum(len(v) for v in vals[:30]) / min(len(vals), 30)
+            if media <= 3:
                 continue
-            score = avg_len * 2 + (50 - n)
-            if score > best_score:
-                best_score = score
-                best_col = col
-
-        return best_col
-
-    def _popular_valores_uf(self, df, col_nome: str):
-        col = get_col(df, col_nome) or col_nome
-        if col not in df.columns:
-            return
-        self._valores_uf = sorted(
-            str(v).strip() for v in df[col].dropna().unique() if str(v).strip()
-        )
-        self._ufs_selecionadas = []
-        self._ufs_personalizado = []
-        self._lbl_uf_var.set("Nenhuma selecionada")
-        self._lbl_uf_pers_var.set("Nenhuma selecionada")
+            score = media * 2 + (50 - n)
+            if score > melhor_score:
+                melhor_score, melhor = score, col
+        return melhor
 
     @staticmethod
     def _detectar_col_comarca(df):
-        # Prioridade: MUN_RES, depois variações comuns
         prioridade = ["MUN_RES", "MUNICIPIO_RES", "MUNICIPIO", "MUNICÍPIO",
                       "CIDADE", "MUN_COMARCA", "MUNICIPIO_COMARCA"]
-        cols_upper = {c.strip().upper(): c for c in df.columns}
+        cols = {c.strip().upper(): c for c in df.columns}
         for nome in prioridade:
-            if nome in cols_upper:
-                return cols_upper[nome]
-
+            if nome in cols:
+                return cols[nome]
         for col in df.columns:
             u = col.strip().upper()
             if u.startswith("MUN_") or "MUNIC" in u:
                 return col
-
         return None
 
-    def _popular_valores_comarca(self, df, col_nome: str):
-        col = get_col(df, col_nome) or col_nome
-        if col not in df.columns:
-            return
-        self._valores_comarca = sorted(
-            str(v).strip() for v in df[col].dropna().unique() if str(v).strip()
-        )
-        self._comarcas_selecionadas = []
-        self._lbl_comarca_var.set("Nenhuma selecionada")
-
-    # ── Toggle filtro de data ─────────────────────────────────────────────────
-
-    def _toggle_filtro_data(self):
-        ativo = self._chk_filtro_data.get() and bool(self._date_cols)
-        state_cmb = "readonly" if ativo else "disabled"
-        state_ent = "normal" if ativo else "disabled"
-        self._cmb_data_col.config(state=state_cmb)
-        self._ent_data_inicio.config(state=state_ent)
-        self._ent_data_fim.config(state=state_ent)
-        if not ativo:
-            self._data_inicio_var.set("")
-            self._data_fim_var.set("")
-
-    # ── Selecionar pasta ──────────────────────────────────────────────────────
-
-    def _selecionar_pasta(self):
-        pasta = filedialog.askdirectory(title="Selecionar pasta de saída")
-        if pasta:
-            self._out_path.set(pasta)
-
-    # ── Validação ─────────────────────────────────────────────────────────────
-
-    def _validar_selecao(self):
-        personalizado_ok = (
-            self._chk_personalizado.get() and bool(self._colunas_personalizado)
-        )
-        pbi_ok = self._chk_powerbi.get() and bool(self._pbix_template.get().strip())
-        nenhum = (
-            not self._chk_geral.get()
-            and not self._chk_ativos.get()
-            and not personalizado_ok
-            and not pbi_ok
-        )
-        self._btn_gerar.config(state="disabled" if nenhum else "normal")
-
-    # ── Diálogo de seleção de seccionais ─────────────────────────────────────
+    @staticmethod
+    def _detectar_col_adimplencia(df) -> str | None:
+        prioridade = ["SIT_FIN_ATUAL", "SITUACAO_FIN_ATUAL", "SIT_FIN",
+                      "ADIMPLENCIA", "ADIMPLÊNCIA", "SITUACAO_FINANCEIRA",
+                      "SITUACAO_FINANCEIRA_INSCRICAO", "SIT_FINANCEIRA",
+                      "ANUIDADE", "STATUS_FINANCEIRO"]
+        cols = {c.strip().upper(): c for c in df.columns}
+        for nome in prioridade:
+            if nome in cols:
+                return cols[nome]
+        # "FIN" sozinho casaria com DEFINITIVO (TIPO_INSCRICAO)
+        termos = ("ADIMPL", "FINANC", "ANUIDADE", "SIT_FIN", "FIN_ATUAL",
+                  "SITUACAO_FIN")
+        for col in df.columns:
+            u = col.strip().upper()
+            if any(t in u for t in termos):
+                return col
+        return None
 
     @staticmethod
-    def _fmt_ufs(ufs: list[str]) -> str:
-        if not ufs:
-            return "Nenhuma selecionada"
-        if len(ufs) <= 2:
-            return ", ".join(ufs)
-        return f"{len(ufs)} selecionadas"
+    def _classificar_adimplencia(valores: list[str]) -> tuple[list[str], list[str]]:
+        adimp, inad = [], []
+        for v in valores:
+            u = v.strip().upper()
+            if any(t in u for t in ("INADIMPL", "ATRASO", "DEVEDOR", "DEBITO",
+                                    "DÉBITO", "PENDENTE", "VENCID")):
+                inad.append(v)
+            elif any(t in u for t in ("ADIMPL", "REGULAR", "QUITE", "EM DIA",
+                                      "QUITADO", "PAGO")):
+                adimp.append(v)
+        return adimp, inad
 
-    def _abrir_seletor_seccionais(self, target: str):
-        if target == "comarca":
-            valores = self._valores_comarca
-            atual = self._comarcas_selecionadas
-            titulo = "Selecionar Municípios"
-            rotulo = "Municípios disponíveis"
+    def _valores_da_coluna(self, col_nome: str) -> list[str]:
+        if self._df is None or not col_nome:
+            return []
+        col = get_col(self._df, col_nome) or col_nome
+        if col not in self._df.columns:
+            return []
+        return sorted(
+            str(v).strip() for v in self._df[col].dropna().unique() if str(v).strip())
+
+    # ── Estagiários ──────────────────────────────────────────────────────────
+
+    def _cats_estagiarios(self) -> set[str]:
+        return {
+            c for c in self._cats_disponiveis
+            if unicodedata.normalize("NFKD", str(c))
+            .encode("ascii", "ignore").decode().strip().upper().startswith("ESTAGI")
+        }
+
+    def _cats_efetivas(self) -> set[str] | None:
+        base = set(self._cats_selecionadas) if self._filtros_customizados else None
+        if not self._chk_estagiarios.isChecked():
+            return base
+        extras = self._cats_estagiarios()
+        if not extras:
+            return base
+        return (set(CATEGORIAS_ATIVAS) if base is None else base) | extras
+
+    def _ao_alternar_estagiarios(self, *_):
+        # As duas caixas refletem o mesmo recorte de "ativos"
+        marcado = self._chk_estagiarios.isChecked()
+        if self._chk_estagiarios_pers.isChecked() != marcado:
+            self._chk_estagiarios_pers.blockSignals(True)
+            self._chk_estagiarios_pers.setChecked(marcado)
+            self._chk_estagiarios_pers.blockSignals(False)
+
+        if not marcado:
+            texto = ""
+        elif extras := self._cats_estagiarios():
+            texto = "Somando: " + ", ".join(sorted(extras))
         else:
-            valores = self._valores_uf
-            atual = self._ufs_selecionadas if target == "principal" else self._ufs_personalizado
-            titulo = "Selecionar Seccionais"
-            rotulo = "Seccionais disponíveis"
+            texto = ("Nenhuma categoria de estagiário encontrada na coluna CATEGORIA "
+                     "deste arquivo — nada será somado.")
+        self._lbl_estagiarios.setText(texto)
+        self._lbl_estagiarios_pers.setText(
+            texto if self._rb_pers_ativos.isChecked() else "")
 
-        if not valores:
-            return
+    def _ao_alternar_estagiarios_pers(self, marcado: bool):
+        if self._chk_estagiarios.isChecked() != marcado:
+            self._chk_estagiarios.setChecked(marcado)
+        else:
+            self._ao_alternar_estagiarios()
 
-        dlg = tk.Toplevel(self)
-        dlg.title(titulo)
-        dlg.resizable(False, True)
-        dlg.grab_set()
+    def _ao_trocar_base_personalizado(self, *_):
+        ativos = self._rb_pers_ativos.isChecked()
+        self._chk_estagiarios_pers.setEnabled(
+            ativos and self._df is not None and bool(self._cats_disponiveis))
+        self._ao_alternar_estagiarios()
 
-        uf_vars: dict[str, tk.BooleanVar] = {}
-
-        frm_topo = ttk.Frame(dlg)
-        frm_topo.pack(fill="x", padx=12, pady=(10, 4))
-
-        # Pré-cria todos os BooleanVars para preservar estado durante a busca
-        for uf in valores:
-            uf_vars[uf] = tk.BooleanVar(value=uf in atual)
-
-        def _sel_todas():
-            for v in uf_vars.values():
-                v.set(True)
-
-        def _limpar():
-            for v in uf_vars.values():
-                v.set(False)
-
-        ttk.Button(frm_topo, text="Selecionar Todas", command=_sel_todas, width=16).pack(side="left", padx=(0, 6))
-        ttk.Button(frm_topo, text="Limpar", command=_limpar, width=10).pack(side="left")
-
-        # Campo de busca com botão
-        frm_busca = ttk.Frame(dlg)
-        frm_busca.pack(fill="x", padx=12, pady=(0, 4))
-        ttk.Label(frm_busca, text="Buscar:").pack(side="left", padx=(0, 4))
-        busca_var = tk.StringVar()
-        ent_busca = ttk.Entry(frm_busca, textvariable=busca_var, width=24)
-        ent_busca.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        ent_busca.focus_set()
-
-        frm_lista = ttk.LabelFrame(dlg, text=rotulo)
-        frm_lista.pack(fill="both", expand=True, padx=12, pady=4)
-
-        canvas = tk.Canvas(frm_lista, width=300, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(frm_lista, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        inner = ttk.Frame(canvas)
-        canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
-
-        def _refresh_lista(_=None):
-            for w in inner.winfo_children():
-                w.destroy()
-            filtro = busca_var.get().strip().lower()
-            for uf in valores:
-                if filtro and filtro not in uf.lower():
-                    continue
-                ttk.Checkbutton(inner, text=uf, variable=uf_vars[uf]).pack(anchor="w", padx=8, pady=1)
-            inner.update_idletasks()
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.yview_moveto(0)
-
-        ttk.Button(frm_busca, text="Buscar", command=_refresh_lista, width=8).pack(side="left")
-        ent_busca.bind("<Return>", _refresh_lista)
-
-        _refresh_lista()
-
-        def _on_configure(_e=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(canvas_window, width=canvas.winfo_width())
-
-        inner.bind("<Configure>", _on_configure)
-        canvas.bind("<Configure>", _on_configure)
-
-        def _scroll(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _scroll)
-
-        canvas.config(height=min(max(len(valores) * 24, 80), 400))
-
-        frm_btn = ttk.Frame(dlg)
-        frm_btn.pack(padx=12, pady=10)
-
-        def _ok():
-            canvas.unbind_all("<MouseWheel>")
-            selecionadas = [uf for uf in valores if uf_vars[uf].get()]
-            if target == "principal":
-                self._ufs_selecionadas = selecionadas
-                self._lbl_uf_var.set(self._fmt_ufs(selecionadas))
-            elif target == "comarca":
-                self._comarcas_selecionadas = selecionadas
-                self._lbl_comarca_var.set(self._fmt_ufs(selecionadas))
-            else:
-                self._ufs_personalizado = selecionadas
-                self._lbl_uf_pers_var.set(self._fmt_ufs(selecionadas))
-            self._validar_selecao()
-            dlg.destroy()
-
-        def _cancelar():
-            canvas.unbind_all("<MouseWheel>")
-            dlg.destroy()
-
-        ttk.Button(frm_btn, text="OK", command=_ok, width=10).pack(side="left", padx=6)
-        ttk.Button(frm_btn, text="Cancelar", command=_cancelar, width=10).pack(side="left", padx=6)
-
-        dlg.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
-        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_reqheight()) // 2
-        dlg.geometry(f"+{x}+{y}")
-
-    # ── Diálogo de filtros de Ativos ──────────────────────────────────────────
+    # ── Diálogos ─────────────────────────────────────────────────────────────
 
     def _abrir_filtros_ativos(self):
         if not self._cats_disponiveis and not self._sits_disponiveis:
             return
-
-        dlg = tk.Toplevel(self)
-        dlg.title("Filtros — Geral Ativos")
-        dlg.resizable(False, False)
-        dlg.grab_set()
-
-        cat_vars: dict[str, tk.BooleanVar] = {}
-        sit_vars: dict[str, tk.BooleanVar] = {}
-
-        if self._cats_disponiveis:
-            frm_cat = ttk.LabelFrame(dlg, text="Categorias a incluir")
-            frm_cat.pack(fill="x", padx=12, pady=(10, 4))
-            for cat in self._cats_disponiveis:
-                var = tk.BooleanVar(value=cat in self._cats_selecionadas)
-                cat_vars[cat] = var
-                ttk.Checkbutton(frm_cat, text=cat, variable=var).pack(anchor="w", padx=8, pady=1)
-
-        if self._sits_disponiveis:
-            frm_sit = ttk.LabelFrame(dlg, text="Situações a incluir")
-            frm_sit.pack(fill="x", padx=12, pady=4)
-            for sit in self._sits_disponiveis:
-                padrao = sit in SITUACOES_ATIVAS
-                customizado = sit in self._sits_selecionadas
-                marcado = customizado if self._filtros_customizados else padrao
-                var = tk.BooleanVar(value=marcado)
-                sit_vars[sit] = var
-                ttk.Checkbutton(frm_sit, text=sit, variable=var).pack(anchor="w", padx=8, pady=1)
-
-        frm_btn = ttk.Frame(dlg)
-        frm_btn.pack(padx=12, pady=10)
-
-        def _ok():
-            self._cats_selecionadas = {c for c, v in cat_vars.items() if v.get()}
-            self._sits_selecionadas = {s for s, v in sit_vars.items() if v.get()}
+        sits_marcadas = (self._sits_selecionadas if self._filtros_customizados
+                         else {s for s in self._sits_disponiveis
+                               if s in SITUACOES_ATIVAS})
+        dlg = DialogoFiltrosAtivos(
+            self, self._cats_disponiveis, self._sits_disponiveis,
+            self._cats_selecionadas, sits_marcadas)
+        if dlg.exec() == QDialog.Accepted:
+            self._cats_selecionadas = dlg.categorias()
+            self._sits_selecionadas = dlg.situacoes()
             self._filtros_customizados = True
-            dlg.destroy()
-
-        ttk.Button(frm_btn, text="OK", command=_ok, width=10).pack(side="left", padx=6)
-        ttk.Button(frm_btn, text="Cancelar", command=dlg.destroy, width=10).pack(side="left", padx=6)
-
-        dlg.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
-        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_reqheight()) // 2
-        dlg.geometry(f"+{x}+{y}")
-
-    # ── Diálogo de seleção de colunas ─────────────────────────────────────────
+            self._log_append(
+                f"Filtros de ativos: {len(self._cats_selecionadas)} categoria(s), "
+                f"{len(self._sits_selecionadas)} situação(ões)", "info")
 
     def _abrir_seletor_colunas(self):
-        if not self._cols_disponiveis:
+        dlg = DialogoColunas(
+            self, "Selecionar colunas — Relatório personalizado",
+            self._cols_disponiveis, self._colunas_personalizado,
+            self._filtros_coluna_personalizado, self._valores_da_coluna)
+        if dlg.exec() != QDialog.Accepted:
             return
+        self._colunas_personalizado = dlg.selecionadas()
+        self._filtros_coluna_personalizado = {
+            c: v for c, v in self._filtros_coluna_personalizado.items()
+            if c in self._colunas_personalizado
+        }
+        self._lbl_colunas.setText(self._descrever_colunas(
+            self._colunas_personalizado, self._filtros_coluna_personalizado))
+        self._atualizar_botoes()
 
-        dlg = tk.Toplevel(self)
-        dlg.title("Selecionar Colunas — Relatório Personalizado")
-        dlg.resizable(False, True)
-        dlg.grab_set()
+    def _abrir_seletor_colunas_sep(self):
+        dlg = DialogoColunas(
+            self, "Selecionar colunas — Relatórios separados",
+            self._cols_disponiveis, self._sep_colunas,
+            self._filtros_coluna_sep, self._valores_da_coluna)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._sep_colunas = dlg.selecionadas()
+        # Filtros valem mesmo sem a coluna estar na saída — só descarta os vazios
+        self._filtros_coluna_sep = {c: v for c, v in self._filtros_coluna_sep.items() if v}
+        self._atualizar_lbls_sep()
 
-        # Botões de ação rápida
-        frm_topo = ttk.Frame(dlg)
-        frm_topo.pack(fill="x", padx=12, pady=(10, 4))
+    def _abrir_seletor_subsecoes(self):
+        if not self._uf_col or not self._valores_uf:
+            QMessageBox.warning(
+                self, "Relatórios separados",
+                "Coluna de subseção não detectada no arquivo. Não é possível "
+                "separar por subseção.")
+            return
+        dlg = DialogoListaMarcavel(
+            self, "Selecionar subseções — Relatórios separados",
+            f"Subseções disponíveis ({self._uf_col})",
+            self._valores_uf, self._sep_subsecoes)
+        if dlg.exec() == QDialog.Accepted:
+            self._sep_subsecoes = dlg.selecionados()
+            self._atualizar_lbls_sep()
 
-        col_vars: dict[str, tk.BooleanVar] = {}
+    def _ao_alternar_separar_adim(self, ligado: bool):
+        self._btn_sep_adim.setVisible(ligado)
+        self._atualizar_lbls_sep()
+        if ligado and self._df is not None and not self._sep_adim_col:
+            self._abrir_config_adimplencia()
 
-        def _sel_todos():
-            for v in col_vars.values():
-                v.set(True)
-
-        def _limpar():
-            for v in col_vars.values():
-                v.set(False)
-
-        ttk.Button(frm_topo, text="Selecionar Todas", command=_sel_todos, width=16).pack(
-            side="left", padx=(0, 6)
-        )
-        ttk.Button(frm_topo, text="Limpar", command=_limpar, width=10).pack(side="left")
-
-        # Lista de colunas com scroll
-        frm_lista = ttk.LabelFrame(dlg, text="Colunas disponíveis")
-        frm_lista.pack(fill="both", expand=True, padx=12, pady=4)
-
-        canvas = tk.Canvas(frm_lista, width=340, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(frm_lista, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        inner = ttk.Frame(canvas)
-        canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
-
-        filtro_btns: dict[str, ttk.Button] = {}
-
-        def _atualizar_btn_filtro(col: str):
-            btn = filtro_btns.get(col)
-            if not btn:
-                return
-            ativo = bool(self._filtros_coluna_personalizado.get(col))
-            btn.config(
-                text="▼ Filtrado" if ativo else "▼ Filtrar",
-                bootstyle="info" if ativo else "secondary-outline",
-            )
-
-        for col in self._cols_disponiveis:
-            already = col in self._colunas_personalizado
-            var = tk.BooleanVar(value=already)
-            col_vars[col] = var
-
-            row = ttk.Frame(inner)
-            row.pack(fill="x", anchor="w", padx=8, pady=1)
-            ttk.Checkbutton(row, text=col, variable=var).pack(side="left", anchor="w")
-            btn_f = ttk.Button(
-                row, text="▼ Filtrar", width=11,
-                command=lambda c=col: self._abrir_filtro_valores(
-                    c, lambda c2=col: _atualizar_btn_filtro(c2)
-                ),
-            )
-            btn_f.pack(side="right", padx=(6, 0))
-            filtro_btns[col] = btn_f
-            _atualizar_btn_filtro(col)
-
-        def _on_configure(_e=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(canvas_window, width=canvas.winfo_width())
-
-        inner.bind("<Configure>", _on_configure)
-        canvas.bind("<Configure>", _on_configure)
-
-        # Scroll com roda do mouse
-        def _scroll(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _scroll)
-
-        # Limitar altura do canvas
-        n = len(self._cols_disponiveis)
-        canvas_h = min(max(n * 24, 80), 400)
-        canvas.config(height=canvas_h)
-
-        # Botões OK / Cancelar
-        frm_btn = ttk.Frame(dlg)
-        frm_btn.pack(padx=12, pady=10)
-
-        def _ok():
-            canvas.unbind_all("<MouseWheel>")
-            selecionadas = [c for c in self._cols_disponiveis if col_vars[c].get()]
-            self._colunas_personalizado = selecionadas
-            # Descarta filtros de colunas que deixaram de estar selecionadas
-            self._filtros_coluna_personalizado = {
-                c: v for c, v in self._filtros_coluna_personalizado.items()
-                if c in selecionadas
-            }
-            n_sel = len(selecionadas)
-            if self._filtros_coluna_personalizado:
-                partes = []
-                for c, v in self._filtros_coluna_personalizado.items():
-                    partes.append(
-                        f"{c}={'/'.join(v)}" if len(v) <= 2 else f"{c}=({len(v)})"
-                    )
-                sufixo_filtro = "  •  Filtros: " + ", ".join(partes)
-            else:
-                sufixo_filtro = ""
-            if n_sel == 0:
-                self._lbl_colunas_var.set("Nenhuma coluna selecionada")
-            elif n_sel <= 4:
-                self._lbl_colunas_var.set(f"{n_sel} colunas: {', '.join(selecionadas)}{sufixo_filtro}")
-            else:
-                preview = ", ".join(selecionadas[:3])
-                self._lbl_colunas_var.set(f"{n_sel} colunas selecionadas ({preview}...){sufixo_filtro}")
-            self._validar_selecao()
-            dlg.destroy()
-
-        def _cancelar():
-            canvas.unbind_all("<MouseWheel>")
-            dlg.destroy()
-
-        ttk.Button(frm_btn, text="OK", command=_ok, width=10).pack(side="left", padx=6)
-        ttk.Button(frm_btn, text="Cancelar", command=_cancelar, width=10).pack(side="left", padx=6)
-
-        dlg.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
-        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_reqheight()) // 2
-        dlg.geometry(f"+{x}+{y}")
-
-    # ── Filtro de valores por coluna (estilo AutoFiltro do Excel) ─────────────
-
-    def _abrir_filtro_valores(self, col_nome: str, on_close=None):
+    def _abrir_config_adimplencia(self):
         if self._df is None:
             return
-        col_real = get_col(self._df, col_nome) or col_nome
-        if col_real not in self._df.columns:
-            return
+        dlg = DialogoAdimplencia(
+            self, self._cols_disponiveis, self._sep_adim_col,
+            self._valores_da_coluna, self._classificar_adimplencia,
+            self._sep_val_adimplente, self._sep_val_inadimplente)
+        if dlg.exec() == QDialog.Accepted:
+            (self._sep_adim_col, self._sep_val_adimplente,
+             self._sep_val_inadimplente) = dlg.resultado()
+            self._atualizar_lbls_sep()
+            self._atualizar_lbls_csv()
 
-        valores = sorted(
-            str(v).strip() for v in self._df[col_real].dropna().unique() if str(v).strip()
+    def _abrir_mapeamento_csv(self):
+        if self._df is None:
+            return
+        _, mapa = mapear_para_oabma(
+            self._df,
+            col_subsecao=self._uf_col,
+            col_cidade=self._comarca_col,
+            col_adimplencia=self._sep_adim_col or None,
+            valores_adimplente=self._sep_val_adimplente,
+            valores_inadimplente=self._sep_val_inadimplente,
+            jovem_desde=self._jovem_desde,
+            jovem_ate=self._jovem_ate,
         )
-        if not valores:
-            messagebox.showinfo(
-                "Filtro", f"A coluna '{col_nome}' não possui valores para filtrar."
-            )
-            return
+        DialogoMapeamentoCsv(self, mapa).exec()
 
-        atual = self._filtros_coluna_personalizado.get(col_nome)  # None = todos
-
-        # Estado leve (dict de bool) — suporta colunas com milhares de valores
-        # distintos sem criar um widget por valor.
-        estado: dict[str, bool] = {
-            v: (atual is None) or (v in atual) for v in valores
-        }
-        MAX_RENDER = 500
-
-        # Formata datas de colunas de data para exibição (DD/MM/AAAA)
-        _is_date = is_date_col(col_nome)
-        _DATE_DISPLAY_FMTS = [
-            ("%Y-%m-%d %H:%M:%S", "%d/%m/%Y"),
-            ("%Y-%m-%dT%H:%M:%S.%f", "%d/%m/%Y"),
-            ("%Y-%m-%dT%H:%M:%S", "%d/%m/%Y"),
-            ("%Y-%m-%d", "%d/%m/%Y"),
-        ]
-
-        def _fmt_val(v: str) -> str:
-            if not _is_date:
-                return v
-            for fmt_in, fmt_out in _DATE_DISPLAY_FMTS:
-                try:
-                    return datetime.strptime(v, fmt_in).strftime(fmt_out)
-                except ValueError:
-                    continue
-            return v
-
-        dlg = tk.Toplevel(self)
-        dlg.title(f"Filtrar — {col_nome}")
-        dlg.resizable(False, True)
-        dlg.grab_set()
-
-        busca_var = tk.StringVar()
-        info_var = tk.StringVar()
-        todos_var = tk.BooleanVar(value=all(estado.values()))
-
-        def _matches() -> list[str]:
-            filtro = busca_var.get().strip().lower()
-            if not filtro:
-                return valores
-            return [v for v in valores if filtro in v.lower() or filtro in _fmt_val(v).lower()]
-
-        # (Selecionar Tudo) — marca/desmarca TODOS os valores (estilo Excel)
-        frm_topo = ttk.Frame(dlg)
-        frm_topo.pack(fill="x", padx=14, pady=(10, 2))
-
-        def _toggle_todos():
-            val = todos_var.get()
-            for v in valores:
-                estado[v] = val
-            _refresh_lista()
-
-        chk_todos = ttk.Checkbutton(
-            frm_topo, text="(Selecionar Tudo)", variable=todos_var,
-            command=_toggle_todos,
-        )
-        chk_todos.pack(side="left", anchor="w")
-
-        # Busca + "Somente estes" (filtra só os resultados da busca)
-        frm_busca = ttk.Frame(dlg)
-        frm_busca.pack(fill="x", padx=12, pady=(4, 2))
-        ttk.Label(frm_busca, text="Pesquisar:").pack(side="left", padx=(0, 4))
-        ent_busca = ttk.Entry(frm_busca, textvariable=busca_var)
-        ent_busca.pack(side="left", fill="x", expand=True)
-        ent_busca.focus_set()
-
-        def _somente_estes():
-            sel = set(_matches())
-            for v in valores:
-                estado[v] = v in sel
-            _refresh_lista()
-
-        ttk.Button(
-            frm_busca, text="Somente estes", command=_somente_estes, width=14,
-            bootstyle="info-outline",
-        ).pack(side="left", padx=(6, 0))
-
-        ttk.Label(
-            dlg, textvariable=info_var, bootstyle="secondary", font=("Segoe UI", 8),
-        ).pack(fill="x", padx=14, pady=(0, 2))
-
-        frm_lista = ttk.LabelFrame(dlg, text="Valores")
-        frm_lista.pack(fill="both", expand=True, padx=12, pady=4)
-
-        canvas = tk.Canvas(frm_lista, width=280, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(frm_lista, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        inner = ttk.Frame(canvas)
-        canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
-
-        # Mantém referências aos BooleanVars renderizados (apenas os visíveis)
-        render_vars: dict[str, tk.BooleanVar] = {}
-
-        def _refresh_lista(_=None):
-            for w in inner.winfo_children():
-                w.destroy()
-            render_vars.clear()
-            matches = _matches()
-            mostrados = matches[:MAX_RENDER]
-            for v in mostrados:
-                bv = tk.BooleanVar(value=estado[v])
-                render_vars[v] = bv
-
-                def _on_toggle(vv=v, b=bv):
-                    estado[vv] = b.get()
-
-                ttk.Checkbutton(
-                    inner, text=_fmt_val(v), variable=bv, command=_on_toggle,
-                ).pack(anchor="w", padx=8, pady=1)
-
-            sel_total = sum(1 for v in valores if estado[v])
-            buscando = bool(busca_var.get().strip())
-            todos_var.set(bool(valores) and all(estado[v] for v in valores))
-            chk_todos.config(
-                text="(Selecionar Tudo)"
-                if not buscando
-                else f"(Selecionar Tudo)    ·    {len(matches)} na busca"
-            )
-            if len(matches) > MAX_RENDER:
-                info_var.set(
-                    f"{sel_total}/{len(valores)} selecionados  •  "
-                    f"mostrando {MAX_RENDER} de {len(matches)} — refine a busca"
-                )
-            else:
-                info_var.set(f"{sel_total}/{len(valores)} selecionados")
-
-            inner.update_idletasks()
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.yview_moveto(0)
-
-        # Debounce da busca para não re-renderizar a cada tecla
-        _busca_after: dict[str, str | None] = {"id": None}
-
-        def _on_busca(_=None):
-            if _busca_after["id"]:
-                self.after_cancel(_busca_after["id"])
-            _busca_after["id"] = self.after(250, _refresh_lista)
-
-        ent_busca.bind("<KeyRelease>", _on_busca)
-        _refresh_lista()
-
-        def _on_configure(_e=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(canvas_window, width=canvas.winfo_width())
-
-        inner.bind("<Configure>", _on_configure)
-        canvas.bind("<Configure>", _on_configure)
-
-        def _scroll(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _scroll)
-
-        canvas.config(height=min(max(len(valores) * 24, 80), 360))
-
-        frm_btn = ttk.Frame(dlg)
-        frm_btn.pack(padx=12, pady=10)
-
-        def _ok():
-            canvas.unbind_all("<MouseWheel>")
-            sel = [v for v in valores if estado[v]]
-            if not sel:
-                messagebox.showwarning(
-                    "Filtro", "Selecione ao menos um valor (ou use 'Remover filtro')."
-                )
-                canvas.bind_all("<MouseWheel>", _scroll)
-                return
-            if len(sel) == len(valores):
-                self._filtros_coluna_personalizado.pop(col_nome, None)  # sem filtro
-            else:
-                self._filtros_coluna_personalizado[col_nome] = sel
-            if on_close:
-                on_close()
-            dlg.destroy()
-
-        def _limpar_filtro():
-            canvas.unbind_all("<MouseWheel>")
-            self._filtros_coluna_personalizado.pop(col_nome, None)
-            if on_close:
-                on_close()
-            dlg.destroy()
-
-        def _cancelar():
-            canvas.unbind_all("<MouseWheel>")
-            dlg.destroy()
-
-        ttk.Button(frm_btn, text="OK", command=_ok, width=10).pack(side="left", padx=4)
-        ttk.Button(frm_btn, text="Remover filtro", command=_limpar_filtro, width=14).pack(side="left", padx=4)
-        ttk.Button(frm_btn, text="Cancelar", command=_cancelar, width=10).pack(side="left", padx=4)
-
-        dlg.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
-        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_reqheight()) // 2
-        dlg.geometry(f"+{x}+{y}")
-
-    # ── Power BI ──────────────────────────────────────────────────────────────
-
-    def _toggle_powerbi(self):
-        state = "normal" if self._chk_powerbi.get() else "disabled"
-        for w in (
-            self._ent_pbix_template, self._btn_pbix_sel,
-            self._ent_pbix_out, self._btn_pbix_out,
-            self._ent_pbix_nome,
-        ):
-            w.config(state=state)
-        self._salvar_config_pbi()
-        self._validar_selecao()
-
-    def _salvar_config_pbi(self):
-        cfg = _load_config()
-        tmpl = self._pbix_template.get()
-        # Não persiste o caminho do template embutido — ele varia por máquina.
-        # Vazio faz o app sempre resolver para o template em assets/.
-        if tmpl and os.path.abspath(tmpl) == os.path.abspath(_PBIX_BUNDLED):
-            cfg["pbix_template"] = ""
-        else:
-            cfg["pbix_template"] = tmpl
-        cfg["pbix_out_path"] = self._pbix_out_path.get()
-        cfg["pbix_nome_saida"] = self._pbix_nome_saida.get()
-        _save_config(cfg)
-
-    def _selecionar_pbix(self):
-        path = filedialog.askopenfilename(
-            title="Selecionar template Power BI",
-            filetypes=[("Power BI", "*.pbix"), ("Todos", "*.*")],
-        )
-        if path:
-            self._pbix_template.set(path)
-            if not self._pbix_out_path.get():
-                self._pbix_out_path.set(os.path.dirname(path))
-            self._salvar_config_pbi()
-
-    def _selecionar_pbix_pasta(self):
-        pasta = filedialog.askdirectory(title="Pasta para salvar o .pbix")
-        if pasta:
-            self._pbix_out_path.set(pasta)
-            self._salvar_config_pbi()
-
-    # ── Gerar ─────────────────────────────────────────────────────────────────
-
-    def _gerar(self):
-        personalizado_ok = self._chk_personalizado.get() and bool(self._colunas_personalizado)
-        if self._chk_personalizado.get() and not self._colunas_personalizado:
-            self._log_append(
-                "Relatório personalizado: clique 'Selecionar Colunas...' e escolha "
-                "ao menos uma coluna.", "erro")
-            return
-
-        gera_excel = self._chk_geral.get() or self._chk_ativos.get() or personalizado_ok
-        pbi_template = self._pbix_template.get().strip()
-        pbi_ok = self._chk_powerbi.get() and bool(pbi_template)
-
-        if not gera_excel and not pbi_ok:
-            self._log_append(
-                "Selecione ao menos um relatório ou ative o Power BI para gerar.", "erro")
-            return
-
-        # Arquivo de dados só é necessário para gerar Excel; o Power BI sozinho
-        # apenas atualiza a data no template, sem precisar da planilha.
-        if gera_excel and self._df is None:
-            self._log_append("Selecione um arquivo válido antes de gerar.", "erro")
-            return
-
-        if pbi_ok and not os.path.isfile(pbi_template):
-            self._log_append(
-                f"Template Power BI não encontrado: {pbi_template}", "erro")
-            return
-
-        pasta = self._out_path.get().strip()
-        if gera_excel and not pasta:
-            self._log_append("Informe a pasta de saída.", "erro")
-            return
-
-        # Pasta de destino do .pbix: usa a configurada ou cai na pasta do Excel
-        pbi_out = self._pbix_out_path.get().strip() or pasta
-        if pbi_ok and not pbi_out:
-            self._log_append(
-                "Informe onde salvar o Power BI (campo 'Salvar .pbix em').", "erro")
-            return
-
-        filtro_data_ativo = self._chk_filtro_data.get() and bool(self._date_cols)
-        data_inicio = self._parse_data_ui(self._data_inicio_var.get()) if filtro_data_ativo else None
-        data_fim = self._parse_data_ui(self._data_fim_var.get()) if filtro_data_ativo else None
-        if filtro_data_ativo and self._data_inicio_var.get().strip() and data_inicio is None:
-            self._log_append("Data inicial inválida. Use o formato dd/mm/aaaa.", "erro")
-            return
-        if filtro_data_ativo and self._data_fim_var.get().strip() and data_fim is None:
-            self._log_append("Data final inválida. Use o formato dd/mm/aaaa.", "erro")
-            return
-
-        geral        = self._chk_geral.get()
-        ativos       = self._chk_ativos.get()
-        data_col = self._data_col_var.get() if filtro_data_ativo else None
-        nome_base = self._nome_base.get().strip() or "RELATORIO CADASTRO ADVOGADOS GERAL"
-        cats = set(self._cats_selecionadas) if self._filtros_customizados else None
-        sits = set(self._sits_selecionadas) if self._filtros_customizados else None
-
-        self._btn_gerar.config(state="disabled", text="Processando...")
-        self._progress["value"] = 0
-        self._log_clear()
-
-        df = self._df.copy() if self._df is not None else None
-        colunas_pers = list(self._colunas_personalizado) if personalizado_ok else None
-        base_pers = self._base_personalizado.get()
-        filtros_valores_pers = (
-            {c: list(v) for c, v in self._filtros_coluna_personalizado.items()
-             if c in self._colunas_personalizado and v}
-            if personalizado_ok else None
-        )
-
-        pbi_nome = self._pbix_nome_saida.get().strip() or None
-
-        def _processar():
-            def progress(pct: int):
-                self.after(0, lambda p=pct: self._progress.config(value=p))
-
-            def log(msg, tag="normal"):
-                self.after(0, lambda m=msg, t=tag: self._log_append(m, t))
-
-            abrir = pasta
-            try:
-                if gera_excel:
-                    gerar_relatorios(
-                        df, pasta, log,
-                        gerar_geral=geral,
-                        gerar_ativos=ativos,
-                        categorias_filtro=cats,
-                        situacoes_filtro=sits,
-                        data_col=data_col,
-                        data_inicio=data_inicio,
-                        data_fim=data_fim,
-                        nome_base=nome_base,
-                        progress_cb=progress,
-                        gerar_personalizado=personalizado_ok,
-                        colunas_personalizado=colunas_pers,
-                        filtros_valores_personalizado=filtros_valores_pers,
-                        personalizado_base=base_pers,
-                    )
-                    log(f"Concluído! Arquivos salvos em: {pasta}", "ok")
-
-                if pbi_ok:
-                    log("Atualizando Power BI...", "info")
-                    dest = atualizar_pbix(pbi_template, pbi_out, pbi_nome)
-                    log(f"Power BI atualizado: {os.path.basename(dest)}", "ok")
-                    abrir = pbi_out
-
-                progress(100)
-                self.after(0, lambda d=abrir: self._abrir_pasta(d))
-            except Exception as exc:
-                self.after(0, lambda e=exc: self._log_append(f"Erro: {e}", "erro"))
-            finally:
-                self.after(0, lambda: self._btn_gerar.config(
-                    state="normal", text="▶   Gerar Relatórios"
-                ))
-
-        threading.Thread(target=_processar, daemon=True).start()
+    # ── Rótulos ──────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _parse_data_ui(s: str) -> datetime | None:
-        s = s.strip()
-        if not s:
+    def _descrever_colunas(selecionadas: list[str],
+                           filtros: dict[str, list[str]]) -> str:
+        if filtros:
+            partes = [f"{c}={'/'.join(v)}" if len(v) <= 2 else f"{c}=({len(v)})"
+                      for c, v in filtros.items()]
+            sufixo = "  •  Filtros: " + ", ".join(partes)
+        else:
+            sufixo = ""
+        n = len(selecionadas)
+        if n == 0:
+            return "Nenhuma coluna selecionada"
+        if n <= 4:
+            return f"{n} colunas: {', '.join(selecionadas)}{sufixo}"
+        return f"{n} colunas selecionadas ({', '.join(selecionadas[:3])}...){sufixo}"
+
+    @staticmethod
+    def _fmt_lista(vals: list[str], vazio: str) -> str:
+        n = len(vals)
+        if n == 0:
+            return vazio
+        if n <= 4:
+            return ", ".join(vals)
+        return f"{n} selecionados ({', '.join(vals[:3])}...)"
+
+    def _atualizar_lbls_csv(self):
+        if not self._sep_adim_col:
+            self._lbl_csv_adim.setText(
+                "Adimplência: nenhuma coluna reconhecida neste arquivo — o "
+                "campo “adimplente” sairá em branco.")
+        else:
+            self._lbl_csv_adim.setText(
+                f"Adimplência: {self._sep_adim_col}  •  adimplente = "
+                f"{self._fmt_lista(self._sep_val_adimplente, '—')}  •  inadimplente = "
+                f"{self._fmt_lista(self._sep_val_inadimplente, '—')}")
+
+        origem = ("personalizado" if self._jovem_personalizado
+                  else f"padrão, últimos {self._jovem_anos} anos")
+        self._lbl_csv_jovem.setText(
+            f"Jovem advogado ({origem}): compromisso de "
+            f"{self._jovem_desde.strftime('%d/%m/%Y')} a "
+            f"{self._jovem_ate.strftime('%d/%m/%Y')}")
+
+    def _abrir_config_jovem(self):
+        dlg = DialogoJovemAdvogado(
+            self, self._jovem_anos, self._jovem_desde, self._jovem_ate,
+            self._jovem_personalizado, periodo_jovem_padrao)
+        if dlg.exec() == QDialog.Accepted:
+            (self._jovem_personalizado, self._jovem_anos,
+             self._jovem_desde, self._jovem_ate) = dlg.resultado()
+            self._atualizar_lbls_csv()
+
+    def _atualizar_lbls_sep(self):
+        total = len(self._valores_uf)
+        n_sub = len(self._sep_subsecoes)
+        if n_sub == 0:
+            self._lbl_sep_sub.setText(
+                f"Nenhuma subseção selecionada — serão geradas todas ({total})"
+                if total else "Nenhuma subseção selecionada")
+        else:
+            self._lbl_sep_sub.setText(
+                f"{n_sub} de {total} subseções: "
+                f"{self._fmt_lista(self._sep_subsecoes, '')}")
+
+        n_col = len(self._sep_colunas)
+        texto = ("Todas as colunas" if n_col == 0
+                 else f"{n_col} colunas: {self._fmt_lista(self._sep_colunas, '')}")
+        if self._filtros_coluna_sep:
+            partes = [f"{c}={'/'.join(v)}" if len(v) <= 2 else f"{c}=({len(v)})"
+                      for c, v in self._filtros_coluna_sep.items()]
+            texto += "  •  Filtros: " + ", ".join(partes)
+        self._lbl_sep_col.setText(texto)
+
+        if not self._chk_sep_adim.isChecked():
+            self._lbl_sep_adim.setText(
+                "Sem separação por adimplência — 1 arquivo por subseção, tudo junto")
+        elif not self._sep_adim_col:
+            self._lbl_sep_adim.setText(
+                "Adimplência: coluna não definida — clique “Adimplência...”")
+        else:
+            self._lbl_sep_adim.setText(
+                f"Adimplência: {self._sep_adim_col}  •  adimplente = "
+                f"{self._fmt_lista(self._sep_val_adimplente, '—')}  •  inadimplente = "
+                f"{self._fmt_lista(self._sep_val_inadimplente, '—')}")
+
+    def _alternar_filtro_data(self, *_):
+        ativo = self._chk_data.isChecked() and bool(self._date_cols)
+        self._cmb_data.setEnabled(ativo)
+        self._data_de.setEnabled(ativo)
+        self._data_ate.setEnabled(ativo)
+        if not ativo:
+            self._data_de.setDate(_DATA_SENTINELA)
+            self._data_ate.setDate(_DATA_SENTINELA)
+
+    def _atualizar_botoes(self, *_):
+        """Cada aba tem sua própria ação; libera só as que dá para executar."""
+        tem = self._df is not None
+        self._btn_prontos.setEnabled(
+            tem and (self._chk_geral.isChecked() or self._chk_ativos.isChecked()))
+        self._btn_pers.setEnabled(tem and bool(self._colunas_personalizado))
+        self._btn_csv.setEnabled(tem)
+        self._btn_separados.setEnabled(tem and bool(self._uf_col))
+
+        if not tem:
+            self._lbl_status.setText("Selecione um arquivo para começar.")
+        else:
+            self._lbl_status.setText(
+                "Pronto — cada aba gera o seu próprio arquivo.")
+
+    # ── Datas ────────────────────────────────────────────────────────────────
+
+    def _intervalo_datas(self):
+        if not (self._chk_data.isChecked() and self._date_cols):
+            return None, None, None
+        de = self._data_de.date()
+        ate = self._data_ate.date()
+        inicio = None if de == _DATA_SENTINELA else datetime(
+            de.year(), de.month(), de.day())
+        fim = None if ate == _DATA_SENTINELA else datetime(
+            ate.year(), ate.month(), ate.day())
+        return self._cmb_data.currentText(), inicio, fim
+
+    # ── Geração ──────────────────────────────────────────────────────────────
+
+    def _base_parametros(self) -> dict | None:
+        """Parâmetros comuns a todas as ações. None (com log) se faltar algo."""
+        if self._df is None:
+            self._log_append("Selecione um arquivo válido antes de gerar.", "erro")
             return None
-        for fmt in _DATE_PARSE_FMTS:
-            try:
-                return datetime.strptime(s, fmt)
-            except ValueError:
-                continue
-        return None
+        pasta = self._ed_saida.text().strip()
+        if not pasta:
+            self._log_append("Informe a pasta de saída.", "erro")
+            return None
+        data_col, data_inicio, data_fim = self._intervalo_datas()
+        return {
+            "df": self._df.copy(),
+            "pasta": pasta,
+            "data_col": data_col,
+            "data_inicio": data_inicio,
+            "data_fim": data_fim,
+            "nome_base": (self._ed_nome.text().strip()
+                          or "RELATORIO CADASTRO ADVOGADOS GERAL"),
+            "cats": self._cats_efetivas(),
+            "sits": (set(self._sits_selecionadas)
+                     if self._filtros_customizados else None),
+        }
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _acoes(self) -> tuple:
+        return (self._btn_prontos, self._btn_pers, self._btn_csv,
+                self._btn_separados)
 
-    def _log_clear(self):
-        self._log.config(state="normal")
-        self._log.delete("1.0", "end")
-        self._log.config(state="disabled")
+    def _ocupado(self, ocupado: bool, botao=None, rotulo: str = ""):
+        for b in self._acoes():
+            b.setEnabled(not ocupado)
+        if ocupado:
+            self._lbl_status.setText("Gerando...")
+            if botao is not None:
+                self._rotulo_original = (botao, botao.text())
+                botao.setText("Processando...")
+        else:
+            anterior = getattr(self, "_rotulo_original", None)
+            if anterior:
+                anterior[0].setText(anterior[1])
+                self._rotulo_original = None
+            self._atualizar_botoes()
+
+    def _executar(self, botao, trabalho):
+        """Roda a geração em outra thread, cuidando de estado e progresso."""
+        self._ocupado(True, botao)
+        self._barra.setValue(0)
+        self._log_limpar()
+        tarefa = self._iniciar(trabalho, self._ao_concluir, self._ao_falhar)
+        tarefa.sinais.progresso.connect(self._barra.setValue)
+        tarefa.sinais.log.connect(self._log_append)
+
+    def _ao_concluir(self, pasta):
+        self._barra.setValue(100)
+        self._log_append(f"Concluído! Arquivos salvos em: {pasta}", "ok")
+        self._ocupado(False)
+        self._lbl_status.setText(f"Concluído — arquivos em {pasta}")
+        self._abrir_pasta(pasta)
+
+    def _ao_falhar(self, msg: str):
+        self._log_append(f"Erro: {msg}", "erro")
+        self._ocupado(False)
+        self._lbl_status.setText("Falhou — veja o log.")
+
+    # ── Ação 1: relatórios prontos ───────────────────────────────────────────
+
+    def _gerar_prontos(self):
+        p = self._base_parametros()
+        if p is None:
+            return
+        geral = self._chk_geral.isChecked()
+        ativos = self._chk_ativos.isChecked()
+        if not (geral or ativos):
+            self._log_append("Marque “Geral” e/ou “Apenas ativos”.", "erro")
+            return
+
+        def _trabalho(sinais):
+            gerar_relatorios(
+                p["df"], p["pasta"],
+                lambda m, t="normal": sinais.log.emit(m, t),
+                gerar_geral=geral,
+                gerar_ativos=ativos,
+                categorias_filtro=p["cats"],
+                situacoes_filtro=p["sits"],
+                data_col=p["data_col"],
+                data_inicio=p["data_inicio"],
+                data_fim=p["data_fim"],
+                nome_base=p["nome_base"],
+                progress_cb=sinais.progresso.emit,
+                gerar_personalizado=False,
+            )
+            return p["pasta"]
+
+        self._executar(self._btn_prontos, _trabalho)
+
+    # ── Ação 2: relatório personalizado ──────────────────────────────────────
+
+    def _gerar_personalizado(self):
+        p = self._base_parametros()
+        if p is None:
+            return
+        if not self._colunas_personalizado:
+            self._log_append(
+                "Clique em “Selecionar colunas...” e escolha ao menos uma coluna.",
+                "erro")
+            return
+        colunas = list(self._colunas_personalizado)
+        filtros = {c: list(v) for c, v in self._filtros_coluna_personalizado.items()
+                   if c in colunas and v} or None
+        base = "ativos" if self._rb_pers_ativos.isChecked() else "geral"
+
+        def _trabalho(sinais):
+            gerar_relatorios(
+                p["df"], p["pasta"],
+                lambda m, t="normal": sinais.log.emit(m, t),
+                gerar_geral=False,
+                gerar_ativos=False,
+                categorias_filtro=p["cats"],
+                situacoes_filtro=p["sits"],
+                data_col=p["data_col"],
+                data_inicio=p["data_inicio"],
+                data_fim=p["data_fim"],
+                nome_base=p["nome_base"],
+                progress_cb=sinais.progresso.emit,
+                gerar_personalizado=True,
+                colunas_personalizado=colunas,
+                filtros_valores_personalizado=filtros,
+                personalizado_base=base,
+            )
+            return p["pasta"]
+
+        self._executar(self._btn_pers, _trabalho)
+
+    # ── Ação 3: CSV de importação ────────────────────────────────────────────
+
+    def _gerar_csv(self):
+        p = self._base_parametros()
+        if p is None:
+            return
+        base = "ativos" if self._rb_csv_ativos.isChecked() else "geral"
+        col_sub, col_cid = self._uf_col, self._comarca_col
+        col_adim = self._sep_adim_col or None
+        adim = list(self._sep_val_adimplente)
+        inad = list(self._sep_val_inadimplente)
+        jovem_de, jovem_ate = self._jovem_desde, self._jovem_ate
+
+        def _trabalho(sinais):
+            exportar_csv_oabma(
+                p["df"], p["pasta"],
+                lambda m, t="normal": sinais.log.emit(m, t),
+                base=base,
+                categorias_filtro=p["cats"],
+                situacoes_filtro=p["sits"],
+                data_col=p["data_col"],
+                data_inicio=p["data_inicio"],
+                data_fim=p["data_fim"],
+                nome_base=p["nome_base"],
+                col_subsecao=col_sub,
+                col_cidade=col_cid,
+                col_adimplencia=col_adim,
+                valores_adimplente=adim,
+                valores_inadimplente=inad,
+                jovem_desde=jovem_de,
+                jovem_ate=jovem_ate,
+                progress_cb=sinais.progresso.emit,
+            )
+            return p["pasta"]
+
+        self._executar(self._btn_csv, _trabalho)
+
+    # ── Ação 4: relatórios separados por subseção ────────────────────────────
+
+    def _gerar_separados_click(self):
+        if self._df is None:
+            return
+        if not self._uf_col or not self._valores_uf:
+            QMessageBox.warning(
+                self, "Relatórios separados",
+                "Coluna de subseção não detectada no arquivo. Não é possível "
+                "separar por subseção.")
+            return
+        if self._chk_sep_adim.isChecked():
+            if not self._sep_adim_col:
+                QMessageBox.warning(
+                    self, "Relatórios separados",
+                    "Clique em “Adimplência...” e escolha a coluna — ou desmarque "
+                    "“Separar cada subseção em adimplentes × inadimplentes”.")
+                return
+            if not self._sep_val_adimplente:
+                QMessageBox.warning(self, "Relatórios separados",
+                                    "Defina os valores de ADIMPLENTE.")
+                return
+            if not self._sep_val_inadimplente:
+                QMessageBox.warning(self, "Relatórios separados",
+                                    "Defina os valores de INADIMPLENTE.")
+                return
+
+        pasta = self._ed_saida.text().strip()
+        if not pasta:
+            self._log_append("Informe a pasta de saída antes de gerar.", "erro")
+            return
+
+        subsecoes = self._sep_subsecoes or list(self._valores_uf)
+        separar = self._chk_sep_adim.isChecked()
+        data_col, data_inicio, data_fim = self._intervalo_datas()
+        args = dict(
+            subsecao_col=self._uf_col,
+            subsecoes=subsecoes,
+            adimplencia_col=self._sep_adim_col if separar else None,
+            valores_adimplente=list(self._sep_val_adimplente) if separar else None,
+            valores_inadimplente=list(self._sep_val_inadimplente) if separar else None,
+            colunas=list(self._sep_colunas) or None,
+            filtros_coluna={c: list(v) for c, v in self._filtros_coluna_sep.items()
+                            if v} or None,
+            base="ativos" if self._rb_sep_ativos.isChecked() else "geral",
+            categorias_filtro=self._cats_efetivas(),
+            situacoes_filtro=(set(self._sits_selecionadas)
+                              if self._filtros_customizados else None),
+            data_col=data_col,
+            data_inicio=data_inicio,
+            data_fim=data_fim,
+            nome_base=(self._ed_nome.text().strip()
+                       or "RELATORIO CADASTRO ADVOGADOS GERAL"),
+        )
+        df = self._df.copy()
+
+        self._ocupado(True, self._btn_separados)
+        self._barra.setValue(0)
+        self._log_limpar()
+        self._log_append(
+            f"Gerando relatórios separados: {len(subsecoes)} subseção(ões) × 2 = "
+            f"{len(subsecoes) * 2} arquivos" if separar else
+            f"Gerando relatórios separados: {len(subsecoes)} arquivo(s), "
+            f"1 por subseção", "info")
+
+        def _trabalho(sinais):
+            gerar_relatorios_separados(
+                df, pasta, lambda m, t="normal": sinais.log.emit(m, t),
+                progress_cb=sinais.progresso.emit, **args)
+            return pasta
+
+        tarefa = self._iniciar(_trabalho, self._ao_concluir, self._ao_falhar)
+        tarefa.sinais.progresso.connect(self._barra.setValue)
+        tarefa.sinais.log.connect(self._log_append)
+
+    # ── Log ──────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _cor_log(tag: str) -> str:
+        p = paleta()
+        return {"ok": p["log_ok"], "erro": p["log_erro"],
+                "info": p["log_info"]}.get(tag, p["log_texto"])
+
+    def _log_limpar(self):
+        self._linhas_log.clear()
+        self._log.clear()
 
     def _log_append(self, texto: str, tag: str = "normal"):
-        self._log.config(state="normal")
-        self._log.insert("end", texto + "\n", tag)
-        self._log.see("end")
-        self._log.config(state="disabled")
+        self._linhas_log.append((texto, tag))
+        self._escrever_linha(texto, tag)
+
+    def _escrever_linha(self, texto: str, tag: str):
+        self._log.appendHtml(
+            f'<span style="color:{self._cor_log(tag)}">{html.escape(texto)}</span>')
+        barra = self._log.verticalScrollBar()
+        barra.setValue(barra.maximum())
+
+
 
     @staticmethod
     def _abrir_pasta(pasta: str):

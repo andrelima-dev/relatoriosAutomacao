@@ -51,7 +51,41 @@ def _parse_date(value: str) -> datetime | None:
     return None
 
 
-def _aplicar_filtro_data(
+def normalizar_filtros(
+    categorias_filtro: set[str] | None,
+    situacoes_filtro: set[str] | None,
+) -> tuple[set[str], set[str]]:
+    cats = categorias_filtro if categorias_filtro is not None else CATEGORIAS_ATIVAS
+    sits = situacoes_filtro if situacoes_filtro is not None else SITUACOES_ATIVAS
+    return {c.upper() for c in cats}, {s.upper() for s in sits}
+
+
+def filtrar_ativos(
+    df: pd.DataFrame,
+    cats: set[str],
+    sits: set[str],
+    obrigatorio: bool = False,
+) -> pd.DataFrame:
+    """Restringe o df às categorias/situações consideradas ativas.
+
+    Com obrigatorio=False, um df sem as colunas CATEGORIA/SITUACAO_INSCRICAO é
+    devolvido intacto; com obrigatorio=True, a ausência delas levanta ValueError.
+    """
+    col_cat = get_col(df, "CATEGORIA")
+    col_sit = get_col(df, "SITUACAO_INSCRICAO")
+    if col_cat is None or col_sit is None:
+        if obrigatorio:
+            faltando = "CATEGORIA" if col_cat is None else "SITUACAO_INSCRICAO"
+            raise ValueError(f"Coluna '{faltando}' não encontrada no XML.")
+        return df
+    mask = (
+        df[col_cat].str.strip().str.upper().isin(cats)
+        & df[col_sit].str.strip().str.upper().isin(sits)
+    )
+    return df[mask].reset_index(drop=True)
+
+
+def aplicar_filtro_data(
     df: pd.DataFrame,
     data_col: str | None,
     data_inicio: datetime | None,
@@ -195,10 +229,9 @@ def gerar_relatorios(
 ) -> dict[str, str | None]:
     os.makedirs(pasta_saida, exist_ok=True)
 
-    cats = {c.upper() for c in (categorias_filtro if categorias_filtro is not None else CATEGORIAS_ATIVAS)}
-    sits = {s.upper() for s in (situacoes_filtro if situacoes_filtro is not None else SITUACOES_ATIVAS)}
+    cats, sits = normalizar_filtros(categorias_filtro, situacoes_filtro)
 
-    df_base = _aplicar_filtro_data(df, data_col, data_inicio, data_fim)
+    df_base = aplicar_filtro_data(df, data_col, data_inicio, data_fim)
 
     tem_personalizado = gerar_personalizado and bool(colunas_personalizado)
     n_reports = sum([
@@ -227,18 +260,7 @@ def gerar_relatorios(
 
     if gerar_ativos:
         log_cb("Gerando GERAL ATIVOS...", "info")
-        col_cat = get_col(df_base, "CATEGORIA")
-        col_sit = get_col(df_base, "SITUACAO_INSCRICAO")
-        if col_cat is None:
-            raise ValueError("Coluna 'CATEGORIA' não encontrada no XML.")
-        if col_sit is None:
-            raise ValueError("Coluna 'SITUACAO_INSCRICAO' não encontrada no XML.")
-
-        mask = (
-            df_base[col_cat].str.strip().str.upper().isin(cats)
-            & df_base[col_sit].str.strip().str.upper().isin(sits)
-        )
-        df_ativos = df_base[mask].reset_index(drop=True)
+        df_ativos = filtrar_ativos(df_base, cats, sits, obrigatorio=True)
 
         path = os.path.join(pasta_saida, _nome_arquivo(nome_base, " ATIVOS"))
         wb, ws = _criar_wb()
@@ -253,16 +275,7 @@ def gerar_relatorios(
         if col_uf_real is None:
             raise ValueError(f"Coluna UF/Seccional '{uf_col or 'UF'}' não encontrada no XML.")
 
-        col_cat = get_col(df_base, "CATEGORIA")
-        col_sit = get_col(df_base, "SITUACAO_INSCRICAO")
-        if col_cat and col_sit:
-            mask_ativos = (
-                df_base[col_cat].str.strip().str.upper().isin(cats)
-                & df_base[col_sit].str.strip().str.upper().isin(sits)
-            )
-            df_filtrado = df_base[mask_ativos].reset_index(drop=True)
-        else:
-            df_filtrado = df_base
+        df_filtrado = filtrar_ativos(df_base, cats, sits)
 
         chunk_uf = chunk // max(len(uf_filtro), 1)
         paths_uf = []
@@ -286,16 +299,7 @@ def gerar_relatorios(
         if col_comarca_real is None:
             raise ValueError("Coluna de município não encontrada no XML.")
 
-        col_cat = get_col(df_base, "CATEGORIA")
-        col_sit = get_col(df_base, "SITUACAO_INSCRICAO")
-        if col_cat and col_sit:
-            mask_ativos = (
-                df_base[col_cat].str.strip().str.upper().isin(cats)
-                & df_base[col_sit].str.strip().str.upper().isin(sits)
-            )
-            df_filtrado_comarca = df_base[mask_ativos].reset_index(drop=True)
-        else:
-            df_filtrado_comarca = df_base
+        df_filtrado_comarca = filtrar_ativos(df_base, cats, sits)
 
         municipios_upper = {m.strip().upper() for m in comarca_filtro}
         mask = df_filtrado_comarca[col_comarca_real].str.strip().str.upper().isin(municipios_upper)
@@ -323,20 +327,12 @@ def gerar_relatorios(
             log_cb("Personalizado: nenhuma coluna válida selecionada.", "erro")
         else:
             # Base do personalizado: "ativos" (padrão) filtra ativos; "geral" usa tudo
-            col_cat = get_col(df_base, "CATEGORIA")
-            col_sit = get_col(df_base, "SITUACAO_INSCRICAO")
             if personalizado_base == "geral":
                 df_ativos_base = df_base
                 log_cb("Personalizado: base GERAL (todos os registros)", "info")
-            elif col_cat and col_sit:
-                mask_ativos = (
-                    df_base[col_cat].str.strip().str.upper().isin(cats)
-                    & df_base[col_sit].str.strip().str.upper().isin(sits)
-                )
-                df_ativos_base = df_base[mask_ativos].reset_index(drop=True)
-                log_cb(f"Personalizado: base ATIVOS ({len(df_ativos_base)} registros)", "info")
             else:
-                df_ativos_base = df_base
+                df_ativos_base = filtrar_ativos(df_base, cats, sits)
+                log_cb(f"Personalizado: base ATIVOS ({len(df_ativos_base)} registros)", "info")
 
             # Filtros de valores por coluna (estilo AutoFiltro do Excel)
             if filtros_valores_personalizado:
@@ -372,3 +368,113 @@ def gerar_relatorios(
         progress_cb(100)
 
     return results
+
+
+def gerar_relatorios_separados(
+    df: pd.DataFrame,
+    pasta_saida: str,
+    log_cb: Callable[[str, str], None],
+    subsecao_col: str,
+    subsecoes: list[str],
+    adimplencia_col: str | None = None,
+    valores_adimplente: list[str] | None = None,
+    valores_inadimplente: list[str] | None = None,
+    colunas: list[str] | None = None,
+    filtros_coluna: dict[str, list[str]] | None = None,
+    base: str = "geral",
+    categorias_filtro: set[str] | None = None,
+    situacoes_filtro: set[str] | None = None,
+    data_col: str | None = None,
+    data_inicio: datetime | None = None,
+    data_fim: datetime | None = None,
+    nome_base: str = "RELATORIO CADASTRO ADVOGADOS GERAL",
+    progress_cb: Callable[[int], None] | None = None,
+) -> dict[str, list[str]]:
+    """Gera um arquivo por subseção. Com adimplencia_col definida, gera 2 por
+    subseção: um só com adimplentes e outro só com inadimplentes.
+    Não altera o fluxo de gerar_relatorios."""
+    os.makedirs(pasta_saida, exist_ok=True)
+
+    col_sub = get_col(df, subsecao_col) or subsecao_col
+    if col_sub not in df.columns:
+        raise ValueError(f"Coluna de subseção '{subsecao_col}' não encontrada no arquivo.")
+    if not subsecoes:
+        raise ValueError("Nenhuma subseção selecionada.")
+
+    separar_adim = bool(adimplencia_col)
+    col_adim = None
+    if separar_adim:
+        col_adim = get_col(df, adimplencia_col) or adimplencia_col
+        if col_adim not in df.columns:
+            raise ValueError(
+                f"Coluna de adimplência '{adimplencia_col}' não encontrada no arquivo.")
+        if not valores_adimplente or not valores_inadimplente:
+            raise ValueError("Defina os valores de adimplente e de inadimplente.")
+
+    df_base = aplicar_filtro_data(df, data_col, data_inicio, data_fim)
+
+    if base == "ativos":
+        cats, sits = normalizar_filtros(categorias_filtro, situacoes_filtro)
+        df_base = filtrar_ativos(df_base, cats, sits)
+        log_cb(f"Separados: base ATIVOS ({len(df_base)} registros)", "info")
+    else:
+        log_cb(f"Separados: base GERAL ({len(df_base)} registros)", "info")
+
+    for nome_col, valores in (filtros_coluna or {}).items():
+        col_real = get_col(df_base, nome_col)
+        if col_real is None or not valores:
+            continue
+        permitidos = {str(v).strip().upper() for v in valores}
+        mask_f = df_base[col_real].astype(str).str.strip().str.upper().isin(permitidos)
+        df_base = df_base[mask_f]
+        log_cb(f"Separados: filtro {nome_col} → {len(df_base)} registros", "info")
+
+    cols_validas = None
+    if colunas:
+        cols_validas = [c for c in colunas if c in df_base.columns]
+        if not cols_validas:
+            raise ValueError("Nenhuma das colunas selecionadas existe no arquivo.")
+
+    serie_sub = df_base[col_sub].astype(str).str.strip()
+
+    if separar_adim:
+        serie_adim = df_base[col_adim].astype(str).str.strip().str.upper()
+        grupos = [
+            ("ADIMPLENTES", {str(v).strip().upper() for v in valores_adimplente}),
+            ("INADIMPLENTES", {str(v).strip().upper() for v in valores_inadimplente}),
+        ]
+    else:
+        serie_adim = None
+        grupos = [("", None)]
+
+    n_reports = max(len(subsecoes) * len(grupos), 1)
+    chunk = 100 / n_reports
+    prog_offset = 0.0
+
+    paths: list[str] = []
+    for sub in subsecoes:
+        sub = str(sub).strip()
+        mask_sub = serie_sub.str.upper() == sub.upper()
+        for grupo_nome, valores in grupos:
+            mask = mask_sub if valores is None else mask_sub & serie_adim.isin(valores)
+            df_grupo = df_base[mask].reset_index(drop=True)
+            if cols_validas:
+                df_grupo = df_grupo[cols_validas].copy()
+            sufixo_sub = sub.upper().replace("/", "-").replace("\\", "-")
+            sufixo = f" {sufixo_sub} {grupo_nome}".rstrip()
+            rotulo = f"{sub} — {grupo_nome}" if grupo_nome else sub
+            log_cb(f"Gerando {rotulo}...", "info")
+            path = os.path.join(pasta_saida, _nome_arquivo(nome_base, sufixo))
+            wb, ws = _criar_wb()
+            _escrever_planilha(
+                ws, df_grupo, progress_cb, int(prog_offset), int(prog_offset + chunk)
+            )
+            path = _salvar_wb(wb, path, log_cb)
+            log_cb(f"Gerando {rotulo}... ✔ ({len(df_grupo)} registros)", "ok")
+            paths.append(path)
+            prog_offset += chunk
+
+    if progress_cb:
+        progress_cb(100)
+
+    return {"separados": paths}

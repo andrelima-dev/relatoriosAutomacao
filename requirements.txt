@@ -2,4 +2,6 @@ pandas
 openpyxl
 lxml
 Pillow
+reportlab
+PySide6
 pyinstaller

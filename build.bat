@@ -28,19 +28,21 @@ if errorlevel 1 (
 )
 
 echo.
-echo Gerando executavel...
-python -m PyInstaller ^
-    --onefile --windowed ^
-    --name "Gerador_OAB" ^
-    --add-data "assets;assets" ^
-    --add-data "core;core" ^
-    --hidden-import lxml.etree ^
-    --hidden-import openpyxl ^
-    --hidden-import pandas ^
-    main.py
+echo Limpando build anterior...
+if exist "build" rmdir /s /q "build"
+if exist "dist\Gerador_OAB.exe" del /q "dist\Gerador_OAB.exe"
 
+echo.
+echo Gerando executavel (Gerador_OAB.spec)...
+python -m PyInstaller --noconfirm Gerador_OAB.spec
 if errorlevel 1 (
     echo [ERRO] Falha ao gerar executavel.
+    pause
+    exit /b 1
+)
+
+if not exist "dist\Gerador_OAB.exe" (
+    echo [ERRO] dist\Gerador_OAB.exe nao foi gerado.
     pause
     exit /b 1
 )
